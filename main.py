@@ -42,7 +42,7 @@ CHARGE_STATION: Tuple[int, int] = (3, 3)
 CELL_PX: int = 64
 MAX_STEPS: int = 250
 MAX_BATTERY: int = 16
-RETURN_SAFETY_MARGIN: int = 6
+RETURN_SAFETY_MARGIN: int = 2
 
 ACTIONS: List[str] = ["UP", "DOWN", "LEFT", "RIGHT"]
 ACTION_DELTAS: Dict[str, Tuple[int, int]] = {
@@ -69,24 +69,29 @@ THEME = {
     "charge":       "#b8860b",
 }
 
-DEFAULT_HP: Dict[str, Any] = {
-    "n_episodes":         1000,
-    "learning_rate":      5e-4,
-    "gamma":              0.99,
-    "batch_size":         64,
-    "buffer_size":        50000,
-    "min_replay_size":    1000,
-    "hidden1":            128,
-    "hidden2":            64,
-    "target_update_freq": 500,
-    "train_freq":         1,
+DEFAULT_HP = {
+    "n_episodes":         6000,      # 10k gereksiz, 6k yeter
+    "learning_rate":      1e-3,      # daha hızlı öğrenir
+    "gamma":              0.97,      # uzun vadeyi biraz azalt (çok önemli)
+    "batch_size":         128,       # stabilite
+    "buffer_size":        20000,     # yeterli
+    "min_replay_size":    3000,      # çok bekleme
+
+    "hidden1":            256,
+    "hidden2":            128,
+
+    "target_update_freq": 200,
+    "train_freq":         2,         # overfit'i azaltır
     "clip_grad":          5.0,
+
     "epsilon_start":      1.0,
     "epsilon_min":        0.05,
-    "epsilon_decay":      0.997,
+    "epsilon_decay":      0.9993,    # daha yavaş decay (KRİTİK)
+
     "reward_scale":       1.0,
-    "stop_reward":        500.0,
-    "goal_reward":        300.0,
+    "stop_reward":        200.0,
+    "goal_reward":        50.0,
+
     "use_cuda":           False,
 }
 
@@ -301,11 +306,9 @@ class CleaningEnv:
             self.battery     -= 1
             self.total_energy += 1
             self.step_count   += 1
-            reward = -2.0
-            if return_required:
-                reward -= 1.0
+            reward = -0.5
             if self.battery <= 0:
-                reward = -120.0
+                reward = -20.0
                 self.done = True
                 self.episode_reward += reward
                 return self._get_state(), reward, True, {"blocked": True, "battery_dead": True}
@@ -322,9 +325,7 @@ class CleaningEnv:
         self.total_energy += 1
         self.step_count   += 1
 
-        reward = -0.5  # küçük adım maliyeti (her adımı mutlaka cezalandır)
-
-        # Hareket öncesi min_dist (kirlilere) hesapla (ödül şekillendirme için)
+        reward = -0.1  # küçük adım maliyeti
         prev_min_dist = self._nearest_dirty_dist(old_r, old_c)
 
         # Yeni temiz hücre
@@ -332,19 +333,12 @@ class CleaningEnv:
             self.dirty_cells.remove((nr, nc))
             self.cleaned[nr,nc] = 1.0
             self.visited_count  += 1
-            reward += 20.0  # temizlik ödülü
+            reward += 3.0
+            if self.visited_count % 5 == 0:
+                reward += 5.0
         elif self.cleaned[nr, nc] == 1 and (nr, nc) != self.charge_pos:
             # Aynı temiz hücrelerde gezinmeyi caydır (loop cezası)
-            reward -= 1.5
-        elif self.dirty_cells and not return_required:
-            # Temizlenmemiş yer varsa ve şarja acil dönülmesi GEREKMİYORSA,
-            # en yakın kirliye yaklaşıp uzaklaşmayı cezalandır/ödüllendir
-            new_min_dist = self._nearest_dirty_dist(nr, nc)
-            
-            if new_min_dist < prev_min_dist:
-                reward += 2.0  # Kirliye doğru bir adım
-            elif new_min_dist > prev_min_dist:
-                reward -= 3.0  # Kirliden uzaklaşıyor (zaman israfı)
+            reward -= 0.5
 
         dist_charge = abs(nr - self.charge_pos[0]) + abs(nc - self.charge_pos[1])
 
@@ -357,39 +351,35 @@ class CleaningEnv:
 
             # Tüm hücreler temizlendi mi? → BAŞARI
             if self.visited_count == self.cleanable_count:
-                reward      += 1000.0
+                reward      += 50.0
                 self.done    = True
                 self.episode_reward += reward
                 return self._get_state(), reward, True, {"success": True}
 
-            # Sadece gerekli şarjı ödüllendir; gereksiz şarj spam'ini sert cezalandır.
-            # Not: at_charge anında dist_charge=0 olur; karar için hareket öncesi mesafe kullanılır.
+            # Sadece gerekli şarjı ödüllendir; gereksiz şarjı hafif cezalandır.
             if old_battery < prev_dist_charge + RETURN_SAFETY_MARGIN:
-                reward += 2.0
+                reward += 0.5
             else:
-                reward -= 5.0
+                reward -= 0.5
 
-        # EĞER her yer temizlendiyse VE henüz şarja gitmemişse,
-        # şarja gitmesi HER ŞEYDEN çok daha önemlidir!
-        if self.visited_count == self.cleanable_count and not at_charge:
+        # Phase-based shaping: tek fazda tek hedef sinyali ver.
+        # Return fazı: batarya kritik veya tüm kirler temizlenmişse şarja yaklaş.
+        return_phase = return_required or (self.visited_count == self.cleanable_count)
+        if return_phase and not at_charge:
             if dist_charge < prev_dist_charge:
-                reward += 10.0
+                reward += 0.5
             elif dist_charge > prev_dist_charge:
-                reward -= 10.0
-            else:
-                reward -= 2.0
-        # Normal batarya kritik kuralı: dönüş güvenlik marjı altındaysa
-        elif return_required and not at_charge:
-            if dist_charge < prev_dist_charge:
-                reward += 2.5
-            elif dist_charge > prev_dist_charge:
-                reward -= 5.0
-            else:
-                reward -= 1.5
+                reward -= 0.5
+        elif (not return_required) and self.dirty_cells:
+            new_min_dist = self._nearest_dirty_dist(nr, nc)
+            if new_min_dist < prev_min_dist:
+                reward += 0.3
+            elif new_min_dist > prev_min_dist:
+                reward -= 0.3
 
         # Batarya bitti
         if self.battery <= 0:
-            reward      = -120.0
+            reward      = -20.0
             self.done    = True
             self.episode_reward += reward
             return self._get_state(), reward, True, {"battery_dead": True}
@@ -471,43 +461,24 @@ def build_network(state_dim, action_dim, hidden1, hidden2):
 
 
 # ─────────────────────────────────────────────
-# REPLAY BUFFER (Öncelikli Deneyim Tekrarlama)
+# REPLAY BUFFER (Hızlı Uniform Örnekleme)
 # ─────────────────────────────────────────────
 
 class PrioritizedReplayBuffer:
     """
-    Öncelikli Deneyim Tekrarlama:
-    Yüksek TD-hatalı geçişleri daha sık örnekler → daha hızlı öğrenme.
-    MAX_BATTERY=16 gibi seyrek ödüllü ortamlarda kritik.
+    Hız odaklı replay buffer.
+    Uniform random.sample kullanır; küçük/orta problemlerde PER'den daha hızlıdır.
     """
     def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
         self.capacity     = capacity
-        self.alpha        = alpha      # öncelik üssü (0=düzgün, 1=tam öncelikli)
-        self.beta_start   = beta_start
-        self.beta_frames  = beta_frames
-        self.frame        = 1
-
         self.buffer    = deque(maxlen=capacity)
-        self.priorities = deque(maxlen=capacity)
+        self.is_prioritized = False
 
     def push(self, state, action, reward, next_state, done):
-        max_prio = max(self.priorities, default=1.0)
         self.buffer.append((state, action, reward, next_state, done))
-        self.priorities.append(max_prio)
 
     def sample(self, batch_size):
-        prios  = np.array(self.priorities, dtype=np.float32)
-        probs  = prios ** self.alpha
-        probs /= probs.sum()
-
-        idxs = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
-        samples = [self.buffer[i] for i in idxs]
-
-        beta = min(1.0, self.beta_start + self.frame * (1.0-self.beta_start) / self.beta_frames)
-        self.frame += 1
-
-        weights = (len(self.buffer) * probs[idxs]) ** (-beta)
-        weights /= weights.max()
+        samples = random.sample(self.buffer, batch_size)
 
         states, actions, rewards, next_states, dones = zip(*samples)
         return (
@@ -516,13 +487,12 @@ class PrioritizedReplayBuffer:
             np.array(rewards,     dtype=np.float32),
             np.array(next_states, dtype=np.float32),
             np.array(dones,       dtype=np.float32),
-            idxs,
-            np.array(weights,     dtype=np.float32),
+            None,
+            np.ones(batch_size,   dtype=np.float32),
         )
 
     def update_priorities(self, idxs, td_errors):
-        for idx, err in zip(idxs, td_errors):
-            self.priorities[idx] = abs(err) + 1e-6  # küçük epsilon: sıfır öncelik olmasın
+        return
 
     def __len__(self):
         return len(self.buffer)
@@ -594,8 +564,9 @@ class DQNAgent:
                 next_q = self.target_net(ns).max(1)[0]
             target = r + float(hp["gamma"]) * next_q * (1-d)
 
-        td_errors = (q_vals - target).detach().cpu().numpy()
-        self.replay.update_priorities(idxs, td_errors)
+        if getattr(self.replay, "is_prioritized", False):
+            td_errors = (q_vals - target).detach().cpu().numpy()
+            self.replay.update_priorities(idxs, td_errors)
 
         loss = (w * nn.SmoothL1Loss(reduction='none')(q_vals, target)).mean()
 
@@ -682,7 +653,8 @@ def select_policy_action(agent, env, state, force_greedy=False):
     # Kritik bataryada, şarja uzaklaştıran adımları engelle.
     rr, rc = env.robot_pos
     cur_dist = abs(rr - env.charge_pos[0]) + abs(rc - env.charge_pos[1])
-    return_required = env.battery <= cur_dist + RETURN_SAFETY_MARGIN
+    # Sadece gerçekten acil durumda (mesafe + 1) dönüş dayat.
+    return_required = env.battery <= cur_dist + 1
 
     valid_actions = []
     for a_idx, a_name in enumerate(ACTIONS):
@@ -728,7 +700,8 @@ def select_policy_action(agent, env, state, force_greedy=False):
 
 def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
                  train_mode=True, episode_start=0, max_total_steps=None,
-                 reward_early_stop=True):
+                 success_early_stop=True, success_stop_window=100,
+                 success_stop_threshold=0.8, success_stop_min_episodes=200):
     episode_data   = []
     total_steps    = 0
     
@@ -736,6 +709,7 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
     debug_success_count = 0
     debug_battery_dead_count = 0
     debug_blocked_count = 0
+    success_history = []
 
     for ep in range(n_episodes):
         if stop_flag and stop_flag[0]: break
@@ -765,8 +739,11 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
             if train_mode:
                 rs = float(hp.get("reward_scale", 1.0))
                 agent.store(state, action, reward*rs, next_state, done)
+                if done and bool(info.get("success", False)):
+                    for _ in range(10):
+                        agent.store(state, action, reward*rs, next_state, done)
                 tf = int(hp.get("train_freq", 1))
-                if steps % tf == 0:
+                if len(agent.replay) > 10000 and steps % tf == 0:
                     agent.train_step()
 
             state         = next_state
@@ -813,8 +790,15 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
             "battery_dead":  ep_battery_dead,
         }
         episode_data.append(info_dict)
+        success_history.append(success)
 
-        if reward_early_stop and total_reward >= hp["stop_reward"] and train_mode and success:
+        if (
+            success_early_stop
+            and train_mode
+            and (ep + 1) >= success_stop_min_episodes
+            and len(success_history) >= success_stop_window
+            and float(np.mean(success_history[-success_stop_window:])) >= float(success_stop_threshold)
+        ):
             if callback: callback(ep, info_dict, env.get_grid_info())
             break
 
@@ -919,9 +903,6 @@ class ChartManager:
         vals = self.data[key]
         if eps:
             ax.plot(eps, vals, color=color, linewidth=1.2, alpha=0.8)
-            if len(vals) >= 20:
-                smooth = np.convolve(vals, np.ones(20)/20, mode='valid')
-                ax.plot(eps[19:], smooth, color="#374151", linewidth=1.8, linestyle="--", alpha=0.7, label="MA-20")
         ax.set_title(title, color=THEME["text"], fontsize=8, pad=3)
         ax.set_xlabel("Episode", color=THEME["text_dim"], fontsize=7)
         ax.set_ylabel(ylabel, color=THEME["text_dim"], fontsize=7)
@@ -962,12 +943,12 @@ HP_SEARCH_SPACE = {
     "hidden1":            [128, 256],
     "hidden2":            [64, 128],
     "batch_size":         [64, 128],
-    "epsilon_decay":      [0.95, 0.99],  # Daha hizli decay, ki epsilon cabuk dusup ogrendigini kullanabilsin
-    "target_update_freq": [100, 500],    # Daha agresif target guncelleme
+    "epsilon_decay":      [0.9995],
+    "target_update_freq": [200],
     "buffer_size":        [10_000, 20_000],
     "epsilon_min":        [0.05],
     "epsilon_start":      [1.0],
-    "train_freq":         [1, 2],
+    "train_freq":         [2, 4],
     "clip_grad":          [5.0],
     "reward_scale":       [1.0],
 }
@@ -986,8 +967,8 @@ def hp_search(base_hp, env_kwargs, use_ddqn, training_budget_steps=50000,
         if stop_flag and stop_flag[0]: break
         hp = base_hp.copy()
         for k,v in zip(keys,combo): hp[k] = v
-        hp["stop_reward"]    = float("inf")
-        hp["min_replay_size"] = min(hp["min_replay_size"], 500)
+        hp["stop_reward"]     = float("inf")
+        hp["min_replay_size"] = max(int(hp.get("min_replay_size", 5000)), 5000)
 
         env         = CleaningEnv(**env_kwargs)
         agent       = DQNAgent(env.state_dim, env.action_dim, hp, use_ddqn=use_ddqn)
@@ -1002,7 +983,11 @@ def hp_search(base_hp, env_kwargs, use_ddqn, training_budget_steps=50000,
 
         data = run_episodes(agent, env, 100000, hp, callback=eval_cb,
                             stop_flag=local_stop, train_mode=True,
-                            max_total_steps=training_budget_steps, reward_early_stop=False)
+                            max_total_steps=training_budget_steps,
+                            success_early_stop=True,
+                            success_stop_window=100,
+                            success_stop_threshold=0.7,
+                            success_stop_min_episodes=200)
         if not data: continue
 
         wd = data[-min(eval_window,len(data)):]
@@ -1064,6 +1049,7 @@ class App:
         self.obstacle_var = tk.StringVar(value="Yok")
         self.use_cuda_var = tk.BooleanVar(value=False)
         self.render_grid_train_var = tk.BooleanVar(value=True)
+        self.capture_gif_train_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.obstacle_var.trace_add("write", self._on_obstacle_map_changed)
@@ -1202,6 +1188,17 @@ class App:
             activebackground=THEME["bg_panel"],
             font=("Consolas",8),
         ).pack(anchor="w", padx=8, pady=(6, 0))
+
+        tk.Checkbutton(
+            sec,
+            text="Eğitimde GIF Frame Kaydet",
+            variable=self.capture_gif_train_var,
+            bg=THEME["bg_panel"],
+            fg=THEME["text"],
+            selectcolor=THEME["bg_card"],
+            activebackground=THEME["bg_panel"],
+            font=("Consolas",8),
+        ).pack(anchor="w", padx=8, pady=(4, 0))
 
     def _build_buttons(self, parent):
         sec = self._section(parent, "🎮 KONTROLLER", pady=6)
@@ -1466,7 +1463,8 @@ class App:
         self._update_info(info)
         self.step_label_var.set(f"Adım: {info['steps']}  |  Episode: {info['episode']}")
         if update_charts:
-            self.chart_mgr.update_all(self.run_id, capture_frame=(ep_idx%20==0))
+            capture_frames = bool(self.capture_gif_train_var.get()) and (ep_idx % 20 == 0)
+            self.chart_mgr.update_all(self.run_id, capture_frame=capture_frames)
         if update_summary:
             self._update_summary()
         if update_status:
@@ -1559,14 +1557,30 @@ class App:
         pb = ttk.Progressbar(pw,length=350,mode="determinate"); pb.pack(pady=5)
         rt = tk.Text(pw,bg=THEME["bg_card"],fg=THEME["text"],font=("Consolas",8),height=18,relief="flat")
         rt.pack(fill="both",expand=True,padx=10,pady=5)
+        hp_keys = list(HP_SEARCH_SPACE.keys())
+        best_score_ref = {"score": -float("inf")}
+
+        def _format_result(result):
+            params = ", ".join(f"{k}={result.get(k, '—')}" for k in hp_keys)
+            metrics = (
+                f"score={result.get('score','—')} | sr={result.get('success_rate','—')} | "
+                f"avg_r={result.get('avg_reward','—')} | avg_e={result.get('avg_energy','—')} | "
+                f"eps={result.get('n_episodes','—')}"
+            )
+            return params, metrics
 
         def progress_cb(done,total,result):
             self.root.after(0,lambda d=done,t=total,r=result: _apply(d,t,r))
         def _apply(done,total,result):
             pb["value"]=done/total*100; pl.config(text=f"Kombinasyon {done}/{total}")
-            rt.insert("end",f"[{done}] score={result.get('score','—')} sr={result.get('success_rate','—')} lr={result.get('learning_rate','—')}\n"); rt.see("end")
-            if float(result.get("score",-1e9)) > float(bv.get().split("=")[-1] if "=" in bv.get() else "-1e9"):
-                bv.set(f"En iyi: score={result.get('score','—')} sr={result.get('success_rate','—')}")
+            params, metrics = _format_result(result)
+            rt.insert("end",f"[{done}] {metrics}\n")
+            rt.insert("end",f"      {params}\n")
+            rt.see("end")
+            cur_score = float(result.get("score", -1e9))
+            if cur_score > best_score_ref["score"]:
+                best_score_ref["score"] = cur_score
+                bv.set(f"En iyi -> {metrics}\n{params}")
 
         def search_thread():
             try:
