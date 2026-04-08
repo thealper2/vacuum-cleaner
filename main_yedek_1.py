@@ -9,7 +9,6 @@ import sys
 import csv
 import json
 import time
-import re
 import copy
 import random
 import itertools
@@ -26,10 +25,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-try:
-    from faker import Faker
-except Exception:
-    Faker = None
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -47,7 +42,7 @@ CHARGE_STATION: Tuple[int, int] = (3, 3)
 CELL_PX: int = 64
 MAX_STEPS: int = 250
 MAX_BATTERY: int = 16
-RETURN_SAFETY_MARGIN: int = 2
+RETURN_SAFETY_MARGIN: int = 1
 
 ACTIONS: List[str] = ["UP", "DOWN", "LEFT", "RIGHT"]
 ACTION_DELTAS: Dict[str, Tuple[int, int]] = {
@@ -74,30 +69,24 @@ THEME = {
     "charge":       "#b8860b",
 }
 
-DEFAULT_HP = {
-    "n_episodes":         6000,      # 10k gereksiz, 6k yeter
-    "learning_rate":      1e-3,      # daha hızlı öğrenir
-    "gamma":              0.97,      # uzun vadeyi biraz azalt (çok önemli)
-    "batch_size":         128,       # stabilite
-    "buffer_size":        50000,     # yeterli
-    "min_replay_size":    3000,      # çok bekleme
-
+DEFAULT_HP: Dict[str, Any] = {
+    "n_episodes":         1000,
+    "learning_rate":      5e-4,
+    "gamma":              0.99,
+    "batch_size":         64,
+    "buffer_size":        50000,
+    "min_replay_size":    1000,
     "hidden1":            256,
     "hidden2":            128,
-
-    "target_update_freq": 200,
-    "train_freq":         2,         # overfit'i azaltır
+    "target_update_freq": 100,
+    "train_freq":         1,
     "clip_grad":          5.0,
-
     "epsilon_start":      1.0,
     "epsilon_min":        0.05,
-    "epsilon_decay":      0.9993,    # daha yavaş decay (KRİTİK)
-
+    "epsilon_decay":      0.997,
     "reward_scale":       1.0,
-    "stop_reward":        200.0,
-    "goal_reward":        50.0,
-
-    "use_cuda":           False,
+    "stop_reward":        500.0,
+    "goal_reward":        300.0,
 }
 
 LOG_DIR:   Path = Path("rl_logs")
@@ -105,8 +94,6 @@ MODEL_DIR: Path = Path("rl_models")
 GIF_DIR:   Path = Path("rl_gifs")
 for _d in [LOG_DIR, MODEL_DIR, GIF_DIR]:
     _d.mkdir(exist_ok=True)
-
-_FAKER = Faker() if Faker is not None else None
 
 # ─────────────────────────────────────────────
 # GÖRSEL YARDIMCILAR
@@ -195,12 +182,10 @@ class CleaningEnv:
     """
 
     def __init__(self, grid_size=7, charge_pos=(3,3), max_battery=MAX_BATTERY,
-                 max_steps=MAX_STEPS, obstacles=None, return_safety_margin=RETURN_SAFETY_MARGIN):
+                 obstacles=None):
         self.grid_size   = grid_size
         self.charge_pos  = charge_pos
         self.max_battery = max_battery
-        self.max_steps   = max_steps
-        self.return_safety_margin = int(return_safety_margin)
         self.obstacles   = set(map(tuple, obstacles or []))
 
         # Temizlenebilir hücre sayısı: şarj istasyonu ve engeller hariç
@@ -214,12 +199,6 @@ class CleaningEnv:
         self.robot_pos      = self.charge_pos
         self.battery        = self.max_battery
         self.cleaned        = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
-        self.dirty_cells    = {
-            (i, j)
-            for i in range(self.grid_size)
-            for j in range(self.grid_size)
-            if (i, j) != self.charge_pos and (i, j) not in self.obstacles
-        }
         self.visited_count  = 0
         self.charge_visits  = 0
         self.total_energy   = 0
@@ -227,11 +206,6 @@ class CleaningEnv:
         self.done           = False
         self.episode_reward = 0.0
         return self._get_state()
-
-    def _nearest_dirty_dist(self, r: int, c: int) -> float:
-        if not self.dirty_cells:
-            return float(self.grid_size * 2)
-        return float(min(abs(r-i) + abs(c-j) for (i, j) in self.dirty_cells))
 
     # ── STATE (DÜZELTİLMİŞ) ──────────────────
     # Eski: sadece 6 sayı → robot grid durumunu göremiyordu!
@@ -250,7 +224,7 @@ class CleaningEnv:
 
         # 2. Batarya (normalize + kritik bayrak)
         bat_norm = self.battery / self.max_battery
-        bat_crit = 1.0 if self.battery <= real_dist_to_charge + self.return_safety_margin else 0.0
+        bat_crit = 1.0 if self.battery <= real_dist_to_charge + RETURN_SAFETY_MARGIN else 0.0
 
         # 3. Dirty grid (7x7=49 hücre, flatten)
         # 0=kirli, 1=temiz veya engel
@@ -262,7 +236,13 @@ class CleaningEnv:
         # 4. Şarj istasyonuna mesafe (Zaten hesaplandı)
 
         # 5. En yakın kirli hücreye mesafe (manhattan)
-        min_dist = self._nearest_dirty_dist(r, c)
+        min_dist = float(self.grid_size * 2)
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                if self.cleaned[i,j] == 0 and (i,j) not in self.obstacles and (i,j) != self.charge_pos:
+                    d = abs(r-i) + abs(c-j)
+                    if d < min_dist:
+                        min_dist = d
         nearest_dirty_norm = min_dist / (self.grid_size*2)
         # Ekstra: Durum değişimi için eski min_dist'i bir yere kaydetmiyoruz, ama 
         # robot bu sayede kirlinin nerede olduğunu doğrudan sayısal olarak da hissedebilir.
@@ -270,7 +250,7 @@ class CleaningEnv:
         # 6. Temizlenme oranı
         clean_ratio = self.visited_count / max(1, self.cleanable_count)
 
-        return_need = 1.0 if self.battery <= real_dist_to_charge + self.return_safety_margin else 0.0
+        return_need = 1.0 if self.battery <= real_dist_to_charge + RETURN_SAFETY_MARGIN else 0.0
 
         state = np.concatenate([
             pos,                             # 2
@@ -304,26 +284,14 @@ class CleaningEnv:
 
         # Düşük bataryada şarja dönme davranışını zorlayıcı ödülle güçlendir.
         # Güvenli dönüş için mesafeye bağlı dinamik bir sınır belirle.
-        return_required = self.battery <= prev_dist_charge + self.return_safety_margin
+        return_required = self.battery <= prev_dist_charge + RETURN_SAFETY_MARGIN
 
         # Duvar veya engel
         if not (0 <= nr < self.grid_size and 0 <= nc < self.grid_size) \
                 or (nr,nc) in self.obstacles:
-            # Geçersiz hamle de zaman/enerji tüketir; aksi halde testte adım sabit kalıp
-            # ajan aynı duvara vurarak "takılmış" gibi görünür.
-            self.battery     -= 1
-            self.total_energy += 1
-            self.step_count   += 1
-            reward = -0.5
-            if self.battery <= 0:
-                reward = -20.0
-                self.done = True
-                self.episode_reward += reward
-                return self._get_state(), reward, True, {"blocked": True, "battery_dead": True}
-            if self.step_count >= self.max_steps:
-                self.done = True
-                self.episode_reward += reward
-                return self._get_state(), reward, True, {"blocked": True, "step_limit": True}
+            reward = -2.0
+            if return_required:
+                reward -= 1.0
             self.episode_reward += reward
             return self._get_state(), reward, False, {"blocked": True}
 
@@ -333,20 +301,37 @@ class CleaningEnv:
         self.total_energy += 1
         self.step_count   += 1
 
-        reward = -0.1  # küçük adım maliyeti
-        prev_min_dist = self._nearest_dirty_dist(old_r, old_c)
+        reward = -0.5  # küçük adım maliyeti (her adımı mutlaka cezalandır)
+
+        # Hareket öncesi min_dist (kirlilere) hesapla (ödül şekillendirme için)
+        prev_min_dist = float('inf')
+        if self.visited_count < self.cleanable_count:
+            for i in range(self.grid_size):
+                for j in range(self.grid_size):
+                    if self.cleaned[i,j] == 0 and (i,j) not in self.obstacles and (i,j) != self.charge_pos:
+                        d = abs(old_r-i) + abs(old_c-j)
+                        if d < prev_min_dist: prev_min_dist = d
 
         # Yeni temiz hücre
-        if (nr, nc) in self.dirty_cells:
-            self.dirty_cells.remove((nr, nc))
+        if (nr,nc) != self.charge_pos and (nr,nc) not in self.obstacles \
+                and self.cleaned[nr,nc] == 0:
             self.cleaned[nr,nc] = 1.0
             self.visited_count  += 1
-            reward += 3.0
-            if self.visited_count % 5 == 0:
-                reward += 5.0
-        elif self.cleaned[nr, nc] == 1 and (nr, nc) != self.charge_pos:
-            # Aynı temiz hücrelerde gezinmeyi caydır (loop cezası)
-            reward -= 0.5
+            reward += 15.0  # temizlik ödülü
+        elif self.visited_count < self.cleanable_count and not return_required:
+            # Temizlenmemiş yer varsa ve şarja acil dönülmesi GEREKMİYORSA,
+            # en yakın kirliye yaklaşıp uzaklaşmayı cezalandır/ödüllendir
+            new_min_dist = float('inf')
+            for i in range(self.grid_size):
+                for j in range(self.grid_size):
+                    if self.cleaned[i,j] == 0 and (i,j) not in self.obstacles and (i,j) != self.charge_pos:
+                        d = abs(nr-i) + abs(nc-j)
+                        if d < new_min_dist: new_min_dist = d
+            
+            if new_min_dist < prev_min_dist:
+                reward += 2.0  # Kirliye doğru bir adım
+            elif new_min_dist > prev_min_dist:
+                reward -= 3.0  # Kirliden uzaklaşıyor (zaman israfı)
 
         dist_charge = abs(nr - self.charge_pos[0]) + abs(nc - self.charge_pos[1])
 
@@ -359,43 +344,44 @@ class CleaningEnv:
 
             # Tüm hücreler temizlendi mi? → BAŞARI
             if self.visited_count == self.cleanable_count:
-                reward      += 50.0
+                reward      += 500.0
                 self.done    = True
                 self.episode_reward += reward
                 return self._get_state(), reward, True, {"success": True}
 
-            # Sadece gerekli şarjı ödüllendir; gereksiz şarjı hafif cezalandır.
-            if old_battery < prev_dist_charge + self.return_safety_margin:
-                reward += 0.5
+            # Şarj ziyareti için küçük ödül (sadece gerçekten şarj olduysa)
+            # Gereksiz şarj dönüşünü cezalandır
+            if old_battery < self.max_battery * 0.5:
+                reward += 5.0   # gerekli şarj
+            elif old_battery < self.max_battery * 0.8:
+                reward += 1.0   # kabul edilebilir
             else:
-                reward -= 0.5
+                reward -= 3.0   # gereksiz şarj
 
-        # Phase-based shaping: tek fazda tek hedef sinyali ver.
-        # Return fazı: batarya kritik veya tüm kirler temizlenmişse şarja yaklaş.
-        return_phase = return_required or (self.visited_count == self.cleanable_count)
-        if return_phase and not at_charge:
+        # EĞER her yer temizlendiyse VE henüz şarja gitmemişse,
+        # şarja gitmesi HER ŞEYDEN çok daha önemlidir!
+        if self.visited_count == self.cleanable_count and not at_charge:
             if dist_charge < prev_dist_charge:
-                reward += 0.5
+                reward += 10.0
             elif dist_charge > prev_dist_charge:
-                reward -= 0.5
-        elif (not return_required) and self.dirty_cells:
-            new_min_dist = self._nearest_dirty_dist(nr, nc)
-            if new_min_dist < prev_min_dist:
-                reward += 0.3
-            elif new_min_dist > prev_min_dist:
-                reward -= 0.3
+                reward -= 10.0
+            else:
+                reward -= 2.0
+        # Normal batarya kritik kuralı: dönüş güvenlik marjı altındaysa
+        elif return_required and not at_charge:
+            if dist_charge < prev_dist_charge:
+                reward += 2.5
+            elif dist_charge > prev_dist_charge:
+                reward -= 5.0
+            else:
+                reward -= 1.5
 
         # Batarya bitti
         if self.battery <= 0:
-            reward      = -20.0
+            reward      = -120.0
             self.done    = True
             self.episode_reward += reward
             return self._get_state(), reward, True, {"battery_dead": True}
-
-        if self.step_count >= self.max_steps:
-            self.done = True
-            self.episode_reward += reward
-            return self._get_state(), reward, True, {"step_limit": True}
 
         self.episode_reward += reward
         return self._get_state(), reward, False, {}
@@ -423,19 +409,29 @@ class CleaningEnv:
 
 def build_network(state_dim, action_dim, hidden1, hidden2):
     """
-    Standart Q-network (MLP).
-    Double DQN mantığı train_step içinde hedef hesaplama sırasında korunur.
+    Dueling DQN mimarisi: avantaj ve değer akışları ayrı.
+    56 boyutlu state için daha güçlü temsil.
     """
-    class QNet(nn.Module):
+    class DuelingNet(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = nn.Sequential(
+            # Ortak özellik çıkarıcı
+            self.shared = nn.Sequential(
                 nn.Linear(state_dim, hidden1),
                 nn.LayerNorm(hidden1),
                 nn.ReLU(),
                 nn.Linear(hidden1, hidden2),
                 nn.LayerNorm(hidden2),
                 nn.ReLU(),
+            )
+            # Değer akışı (V)
+            self.value_stream = nn.Sequential(
+                nn.Linear(hidden2, hidden2 // 2),
+                nn.ReLU(),
+                nn.Linear(hidden2 // 2, 1),
+            )
+            # Avantaj akışı (A)
+            self.advantage_stream = nn.Sequential(
                 nn.Linear(hidden2, hidden2 // 2),
                 nn.ReLU(),
                 nn.Linear(hidden2 // 2, action_dim),
@@ -449,30 +445,53 @@ def build_network(state_dim, action_dim, hidden1, hidden2):
                     nn.init.zeros_(m.bias)
 
         def forward(self, x):
-            return self.net(x)
+            feat = self.shared(x)
+            v    = self.value_stream(feat)
+            a    = self.advantage_stream(feat)
+            # Q = V + (A - mean(A))  →  daha stabil öğrenme
+            return v + (a - a.mean(dim=1, keepdim=True))
 
-    return QNet()
+    return DuelingNet()
 
 
 # ─────────────────────────────────────────────
-# REPLAY BUFFER (Hızlı Uniform Örnekleme)
+# REPLAY BUFFER (Öncelikli Deneyim Tekrarlama)
 # ─────────────────────────────────────────────
 
 class PrioritizedReplayBuffer:
     """
-    Hız odaklı replay buffer.
-    Uniform random.sample kullanır; küçük/orta problemlerde PER'den daha hızlıdır.
+    Öncelikli Deneyim Tekrarlama:
+    Yüksek TD-hatalı geçişleri daha sık örnekler → daha hızlı öğrenme.
+    MAX_BATTERY=16 gibi seyrek ödüllü ortamlarda kritik.
     """
     def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
         self.capacity     = capacity
+        self.alpha        = alpha      # öncelik üssü (0=düzgün, 1=tam öncelikli)
+        self.beta_start   = beta_start
+        self.beta_frames  = beta_frames
+        self.frame        = 1
+
         self.buffer    = deque(maxlen=capacity)
-        self.is_prioritized = False
+        self.priorities = deque(maxlen=capacity)
 
     def push(self, state, action, reward, next_state, done):
+        max_prio = max(self.priorities, default=1.0)
         self.buffer.append((state, action, reward, next_state, done))
+        self.priorities.append(max_prio)
 
     def sample(self, batch_size):
-        samples = random.sample(self.buffer, batch_size)
+        prios  = np.array(self.priorities, dtype=np.float32)
+        probs  = prios ** self.alpha
+        probs /= probs.sum()
+
+        idxs = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
+        samples = [self.buffer[i] for i in idxs]
+
+        beta = min(1.0, self.beta_start + self.frame * (1.0-self.beta_start) / self.beta_frames)
+        self.frame += 1
+
+        weights = (len(self.buffer) * probs[idxs]) ** (-beta)
+        weights /= weights.max()
 
         states, actions, rewards, next_states, dones = zip(*samples)
         return (
@@ -481,12 +500,13 @@ class PrioritizedReplayBuffer:
             np.array(rewards,     dtype=np.float32),
             np.array(next_states, dtype=np.float32),
             np.array(dones,       dtype=np.float32),
-            None,
-            np.ones(batch_size,   dtype=np.float32),
+            idxs,
+            np.array(weights,     dtype=np.float32),
         )
 
     def update_priorities(self, idxs, td_errors):
-        return
+        for idx, err in zip(idxs, td_errors):
+            self.priorities[idx] = abs(err) + 1e-6  # küçük epsilon: sıfır öncelik olmasın
 
     def __len__(self):
         return len(self.buffer)
@@ -502,9 +522,8 @@ class DQNAgent:
         self.action_dim  = action_dim
         self.hp          = hp
         self.use_ddqn    = use_ddqn  # varsayılan True (DDQN daha stabil)
-        use_cuda = bool(hp.get("use_cuda", False))
         self.device      = torch.device(
-            device if device else ("cuda" if (use_cuda and torch.cuda.is_available()) else "cpu"))
+            device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
         self.q_net      = build_network(state_dim, action_dim, hp["hidden1"], hp["hidden2"]).to(self.device)
         self.target_net = copy.deepcopy(self.q_net).to(self.device)
@@ -521,19 +540,6 @@ class DQNAgent:
         self.optim_steps = 0
         self.episode_count = 0
         self.losses: List[float] = []
-
-    @property
-    def algorithm_name(self):
-        return "DDQN" if self.use_ddqn else "DQN"
-
-    def _compute_next_q_ddqn(self, next_states):
-        # Double DQN: aksiyon seçimi online ağdan, değerleme target ağdan yapılır.
-        next_actions = self.q_net(next_states).argmax(1)
-        return self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-
-    def _compute_next_q_dqn(self, next_states):
-        # Vanilla DQN: hedef Q, doğrudan target ağın max Q çıktısıdır.
-        return self.target_net(next_states).max(1)[0]
 
     def select_action(self, state):
         if random.random() < self.epsilon:
@@ -565,14 +571,14 @@ class DQNAgent:
 
         with torch.no_grad():
             if self.use_ddqn:
-                next_q = self._compute_next_q_ddqn(ns)
+                next_actions = self.q_net(ns).argmax(1)
+                next_q = self.target_net(ns).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             else:
-                next_q = self._compute_next_q_dqn(ns)
+                next_q = self.target_net(ns).max(1)[0]
             target = r + float(hp["gamma"]) * next_q * (1-d)
 
-        if getattr(self.replay, "is_prioritized", False):
-            td_errors = (q_vals - target).detach().cpu().numpy()
-            self.replay.update_priorities(idxs, td_errors)
+        td_errors = (q_vals - target).detach().cpu().numpy()
+        self.replay.update_priorities(idxs, td_errors)
 
         loss = (w * nn.SmoothL1Loss(reduction='none')(q_vals, target)).mean()
 
@@ -622,33 +628,6 @@ class DQNAgent:
 def make_run_id():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def _slugify(s: str) -> str:
-    out = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in s.strip().lower())
-    while "__" in out:
-        out = out.replace("__", "_")
-    return out.strip("_") or "model"
-
-def make_model_name() -> str:
-    if _FAKER is not None:
-        try:
-            return _slugify(f"{_FAKER.word()} {_FAKER.word()}")
-        except Exception:
-            pass
-    first = random.choice(["swift", "brave", "smart", "quiet", "rapid", "neat", "lucky", "steady"])
-    second = random.choice(["vacuum", "cleaner", "robot", "agent", "ranger", "worker", "pilot", "keeper"])
-    return _slugify(f"{first} {second}")
-
-def log_run_event(run_id: str, message: str):
-    if not run_id:
-        return
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    path = LOG_DIR / f"run_{run_id}.log"
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {message}\n")
-    except Exception:
-        pass
-
 def save_episode_log(run_id, episode_data):
     path = LOG_DIR / f"run_{run_id}_episodes.csv"
     if not episode_data: return path
@@ -656,59 +635,6 @@ def save_episode_log(run_id, episode_data):
         writer = csv.DictWriter(f, fieldnames=list(episode_data[0].keys()))
         writer.writeheader(); writer.writerows(episode_data)
     return path
-
-def append_episode_params_log(run_id, episode_info, hp, model_name, model_arch, obstacle_map):
-    if not run_id:
-        return None
-    path = LOG_DIR / f"run_{run_id}_episode_params.csv"
-    hp = hp or {}
-    row = {
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "run_id": run_id,
-        "model_name": model_name,
-        "model_arch": model_arch,
-        "obstacle_map": obstacle_map,
-    }
-    row.update({f"hp_{k}": hp.get(k) for k in sorted(hp.keys())})
-    row.update({f"ep_{k}": episode_info.get(k) for k in sorted(episode_info.keys())})
-
-    file_exists = path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-    return path
-
-def _auto_cast_csv_value(v):
-    if v is None:
-        return None
-    if isinstance(v, (int, float, bool)):
-        return v
-    s = str(v).strip()
-    if s == "":
-        return ""
-    lo = s.lower()
-    if lo == "true":
-        return True
-    if lo == "false":
-        return False
-    try:
-        if re.fullmatch(r"[+-]?\d+", s):
-            return int(s)
-        return float(s)
-    except Exception:
-        return s
-
-def load_episode_log(path):
-    rows = []
-    if not path.exists():
-        return rows
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append({k: _auto_cast_csv_value(v) for k, v in row.items()})
-    return rows
 
 def save_hp_search_log(results):
     path = LOG_DIR / f"hp_search_{make_run_id()}.csv"
@@ -723,92 +649,20 @@ def save_hp_search_log(results):
 # EĞİTİM DÖNGÜSÜ
 # ─────────────────────────────────────────────
 
-def select_policy_action(agent, env, state, force_greedy=False):
-    """
-    Eğitim ve testte aynı aksiyon politikasını kullan.
-    force_greedy=True iken ağdan epsilon=0 ile aksiyon seçilir.
-    """
-    if force_greedy:
-        orig = agent.epsilon
-        agent.epsilon = 0.0
-        action = agent.select_action(state)
-        agent.epsilon = orig
-    else:
-        action = agent.select_action(state)
-
-    # Kritik bataryada, şarja uzaklaştıran adımları engelle.
-    rr, rc = env.robot_pos
-    cur_dist = abs(rr - env.charge_pos[0]) + abs(rc - env.charge_pos[1])
-    # Sadece gerçekten acil durumda (mesafe + 1) dönüş dayat.
-    return_required = env.battery <= cur_dist + 1
-
-    valid_actions = []
-    for a_idx, a_name in enumerate(ACTIONS):
-        dr, dc = ACTION_DELTAS[a_name]
-        nr, nc = rr + dr, rc + dc
-        if 0 <= nr < env.grid_size and 0 <= nc < env.grid_size and (nr, nc) not in env.obstacles:
-            valid_actions.append(a_idx)
-
-    # Geçersiz aksiyon seçimini engelle: duvar/engele çarpıp batarya yakmasın.
-    if valid_actions and action not in valid_actions:
-        if force_greedy:
-            with torch.no_grad():
-                s = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
-                q_vals = agent.q_net(s).squeeze(0).detach().cpu().numpy()
-            action = max(valid_actions, key=lambda a: q_vals[a])
-        else:
-            action = random.choice(valid_actions)
-
-    # Çok erken şarja dönmeyi engellemek için sadece gerçek kritik bölgede zorla:
-    # kalan batarya, şarja kalan mesafeye eşit/az ise güvenli aksiyon dayat.
-    if return_required:
-        better_actions = []
-        safe_actions = []
-        for a_idx, a_name in enumerate(ACTIONS):
-            dr, dc = ACTION_DELTAS[a_name]
-            nr, nc = rr + dr, rc + dc
-            if not (0 <= nr < env.grid_size and 0 <= nc < env.grid_size):
-                continue
-            if (nr, nc) in env.obstacles:
-                continue
-            new_dist = abs(nr - env.charge_pos[0]) + abs(nc - env.charge_pos[1])
-            safe_actions.append((a_idx, new_dist))
-            if new_dist < cur_dist:
-                better_actions.append(a_idx)
-        if better_actions:
-            action = random.choice(better_actions)
-        elif safe_actions:
-            best_dist = min(d for _, d in safe_actions)
-            best_actions = [a for a, d in safe_actions if d == best_dist]
-            action = random.choice(best_actions)
-
-    return action
-
 def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
                  train_mode=True, episode_start=0, max_total_steps=None,
-                 success_early_stop=True, success_stop_window=100,
-                 success_stop_threshold=0.8, success_stop_min_episodes=200,
-                 run_id="", log_cb=None):
+                 reward_early_stop=True):
     episode_data   = []
     total_steps    = 0
-    stop_reason = "completed_all_episodes"
-    run_t0 = time.perf_counter()
-    chunk_t0 = run_t0
     
     # Debug training accumulators
     debug_success_count = 0
     debug_battery_dead_count = 0
     debug_blocked_count = 0
-    success_history = []
 
     for ep in range(n_episodes):
-        ep_t0 = time.perf_counter()
-        if stop_flag and stop_flag[0]:
-            stop_reason = "external_stop_flag"
-            break
-        if max_total_steps and total_steps >= max_total_steps:
-            stop_reason = f"max_total_steps_reached({max_total_steps})"
-            break
+        if stop_flag and stop_flag[0]: break
+        if max_total_steps and total_steps >= max_total_steps: break
 
         state          = env.reset()
         total_reward   = 0.0
@@ -818,17 +672,38 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
         ep_blocked = 0
         ep_battery_dead = False
 
-        while not env.done and steps < env.max_steps:
-            if stop_flag and stop_flag[0]:
-                local_stop = True
-                stop_reason = "external_stop_flag"
-                break
-            if max_total_steps and total_steps >= max_total_steps:
-                local_stop = True
-                stop_reason = f"max_total_steps_reached({max_total_steps})"
-                break
+        while not env.done and steps < MAX_STEPS:
+            if stop_flag and stop_flag[0]: local_stop = True; break
+            if max_total_steps and total_steps >= max_total_steps: local_stop = True; break
 
-            action = select_policy_action(agent, env, state, force_greedy=False)
+            action = agent.select_action(state)
+
+            # Kritik bataryada, şarja uzaklaştıran adımları engelle.
+            rr, rc = env.robot_pos
+            cur_dist = abs(rr - env.charge_pos[0]) + abs(rc - env.charge_pos[1])
+            return_required = env.battery <= cur_dist + RETURN_SAFETY_MARGIN
+            # Çok erken şarja dönmeyi engellemek için sadece gerçek kritik bölgede zorla:
+            # kalan batarya, şarja kalan mesafeye eşit/az ise güvenli aksiyon dayat.
+            if return_required and env.battery <= cur_dist:
+                better_actions = []
+                safe_actions = []
+                for a_idx, a_name in enumerate(ACTIONS):
+                    dr, dc = ACTION_DELTAS[a_name]
+                    nr, nc = rr + dr, rc + dc
+                    if not (0 <= nr < env.grid_size and 0 <= nc < env.grid_size):
+                        continue
+                    if (nr, nc) in env.obstacles:
+                        continue
+                    new_dist = abs(nr - env.charge_pos[0]) + abs(nc - env.charge_pos[1])
+                    safe_actions.append((a_idx, new_dist))
+                    if new_dist < cur_dist:
+                        better_actions.append(a_idx)
+                if better_actions:
+                    action = random.choice(better_actions)
+                elif safe_actions:
+                    best_dist = min(d for _, d in safe_actions)
+                    best_actions = [a for a, d in safe_actions if d == best_dist]
+                    action = random.choice(best_actions)
 
             next_state, reward, done, info = env.step(action)
             
@@ -840,11 +715,8 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
             if train_mode:
                 rs = float(hp.get("reward_scale", 1.0))
                 agent.store(state, action, reward*rs, next_state, done)
-                if done and bool(info.get("success", False)):
-                    for _ in range(10):
-                        agent.store(state, action, reward*rs, next_state, done)
                 tf = int(hp.get("train_freq", 1))
-                if len(agent.replay) > 10000 and steps % tf == 0:
+                if steps % tf == 0:
                     agent.train_step()
 
             state         = next_state
@@ -871,22 +743,12 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
 
         # Debug print every 100 episodes
         if train_mode and (ep + 1) % 100 == 0:
-            now = time.perf_counter()
-            chunk_sec = now - chunk_t0
-            total_sec = now - run_t0
             print(f"[DEBUG TRAIN] Ep {ep+1:04d} | Success: {debug_success_count:3d}/100 | "
                   f"Battery Dead: {debug_battery_dead_count:3d}/100 | Blocked Hits Avg: {debug_blocked_count/100:.1f} | "
-                  f"Epsilon: {agent.epsilon:.3f} | Time/100ep: {chunk_sec:.2f}s | Total: {total_sec:.2f}s")
-            if log_cb:
-                log_cb(
-                    f"ep={episode_start + ep + 1} success_100={debug_success_count}/100 "
-                    f"battery_dead_100={debug_battery_dead_count}/100 blocked_avg_100={debug_blocked_count/100:.1f} "
-                    f"epsilon={agent.epsilon:.4f} time_100={chunk_sec:.2f}s total_time={total_sec:.2f}s"
-                )
+                  f"Epsilon: {agent.epsilon:.3f}")
             debug_success_count = 0
             debug_battery_dead_count = 0
             debug_blocked_count = 0
-            chunk_t0 = now
 
         info_dict = {
             "episode":       episode_start + ep + 1,
@@ -899,39 +761,15 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
             "epsilon":       round(agent.epsilon, 4),
             "blocked":       ep_blocked,
             "battery_dead":  ep_battery_dead,
-            "time_since_start_sec": round(time.perf_counter() - run_t0, 3),
-            "episode_chunk_time_sec": round(time.perf_counter() - ep_t0, 3),
-            "stop_reason": "",
         }
         episode_data.append(info_dict)
-        success_history.append(success)
 
-        if (
-            success_early_stop
-            and train_mode
-            and (ep + 1) >= success_stop_min_episodes
-            and len(success_history) >= success_stop_window
-            and float(np.mean(success_history[-success_stop_window:])) >= float(success_stop_threshold)
-        ):
-            cur_sr = float(np.mean(success_history[-success_stop_window:]))
-            stop_reason = (
-                f"success_early_stop(sr={cur_sr:.3f}, window={success_stop_window}, "
-                f"threshold={float(success_stop_threshold):.3f})"
-            )
-            info_dict["stop_reason"] = stop_reason
+        if reward_early_stop and total_reward >= hp["stop_reward"] and train_mode and success:
             if callback: callback(ep, info_dict, env.get_grid_info())
             break
 
         if callback: callback(ep, info_dict, env.get_grid_info())
 
-    setattr(agent, "last_stop_reason", stop_reason)
-    setattr(agent, "last_stop_episode", episode_start + len(episode_data))
-    if log_cb:
-        elapsed = time.perf_counter() - run_t0
-        log_cb(
-            f"run_end episodes={len(episode_data)} stop_reason={stop_reason} "
-            f"total_steps={total_steps} elapsed={elapsed:.2f}s"
-        )
     return episode_data
 
 
@@ -1031,6 +869,9 @@ class ChartManager:
         vals = self.data[key]
         if eps:
             ax.plot(eps, vals, color=color, linewidth=1.2, alpha=0.8)
+            if len(vals) >= 20:
+                smooth = np.convolve(vals, np.ones(20)/20, mode='valid')
+                ax.plot(eps[19:], smooth, color="#374151", linewidth=1.8, linestyle="--", alpha=0.7, label="MA-20")
         ax.set_title(title, color=THEME["text"], fontsize=8, pad=3)
         ax.set_xlabel("Episode", color=THEME["text_dim"], fontsize=7)
         ax.set_ylabel(ylabel, color=THEME["text_dim"], fontsize=7)
@@ -1068,15 +909,15 @@ class ChartManager:
 HP_SEARCH_SPACE = {
     "learning_rate":      [5e-4, 1e-3],
     "gamma":              [0.99],
-    "hidden1":            [128, 256],
-    "hidden2":            [64, 128],
+    "hidden1":            [256, 512],
+    "hidden2":            [128, 256],
     "batch_size":         [64, 128],
-    "epsilon_decay":      [0.9995],
-    "target_update_freq": [200],
+    "epsilon_decay":      [0.95, 0.99],  # Daha hizli decay, ki epsilon cabuk dusup ogrendigini kullanabilsin
+    "target_update_freq": [100, 200],    # Daha agresif target guncelleme
     "buffer_size":        [10_000, 20_000],
     "epsilon_min":        [0.05],
     "epsilon_start":      [1.0],
-    "train_freq":         [2, 4],
+    "train_freq":         [1, 2],
     "clip_grad":          [5.0],
     "reward_scale":       [1.0],
 }
@@ -1095,8 +936,8 @@ def hp_search(base_hp, env_kwargs, use_ddqn, training_budget_steps=50000,
         if stop_flag and stop_flag[0]: break
         hp = base_hp.copy()
         for k,v in zip(keys,combo): hp[k] = v
-        hp["stop_reward"]     = float("inf")
-        hp["min_replay_size"] = max(int(hp.get("min_replay_size", 5000)), 5000)
+        hp["stop_reward"]    = float("inf")
+        hp["min_replay_size"] = min(hp["min_replay_size"], 500)
 
         env         = CleaningEnv(**env_kwargs)
         agent       = DQNAgent(env.state_dim, env.action_dim, hp, use_ddqn=use_ddqn)
@@ -1111,11 +952,7 @@ def hp_search(base_hp, env_kwargs, use_ddqn, training_budget_steps=50000,
 
         data = run_episodes(agent, env, 100000, hp, callback=eval_cb,
                             stop_flag=local_stop, train_mode=True,
-                            max_total_steps=training_budget_steps,
-                            success_early_stop=True,
-                            success_stop_window=100,
-                            success_stop_threshold=0.7,
-                            success_stop_min_episodes=200)
+                            max_total_steps=training_budget_steps, reward_early_stop=False)
         if not data: continue
 
         wd = data[-min(eval_window,len(data)):]
@@ -1155,9 +992,6 @@ class App:
         self.agent         = None
         self.env           = None
         self.run_id        = ""
-        self.model_name    = ""
-        self.model_name_slug = ""
-        self.current_train_hp = {}
         self.stop_flag     = [False]
         self.episode_data  = []
         self.is_training   = False
@@ -1166,24 +1000,10 @@ class App:
         self.hp_thread     = None
         self.chart_mgr     = ChartManager()
         self.grid_images   = []
-        self.summary_totals = {
-            "episodes": 0,
-            "success": 0.0,
-            "reward": 0.0,
-            "steps": 0.0,
-            "energy": 0.0,
-            "charge_visits": 0.0,
-        }
 
         self.hp_vars      = {}
         self.model_var    = tk.StringVar(value="DDQN")  # varsayılan DDQN
-        self.model_name_var = tk.StringVar(value="")
-        self.load_model_name_var = tk.StringVar(value="")
         self.obstacle_var = tk.StringVar(value="Yok")
-        self.use_cuda_var = tk.BooleanVar(value=False)
-        self.return_margin_var = tk.IntVar(value=RETURN_SAFETY_MARGIN)
-        self.render_grid_train_var = tk.BooleanVar(value=True)
-        self.capture_gif_train_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.obstacle_var.trace_add("write", self._on_obstacle_map_changed)
@@ -1243,7 +1063,6 @@ class App:
 
         self._build_env_info(sf); self._build_hp_section(sf)
         self._build_options_section(sf); self._build_buttons(sf)
-        self._build_model_load_section(sf)
 
         self.status_var = tk.StringVar(value="⏳ Hazır")
         tk.Label(left, textvariable=self.status_var, bg=THEME["bg_dark"], fg=THEME["accent"],
@@ -1255,8 +1074,7 @@ class App:
         for key, lbl in [("episode","Episode:"),("reward","Son Ödül:"),("steps","Adım:"),
                           ("energy","Enerji:"),("charge_visits","Şarj Dönüşü:"),
                           ("success_rate","Başarı Oranı:"),("epsilon","Epsilon:"),
-                          ("battery","Batarya:"),("cleaned","Temizlenen:"),
-                          ("model_name","Model Adı:"),("algorithm","Algoritma:")]:
+                          ("battery","Batarya:"),("cleaned","Temizlenen:")]:
             row = tk.Frame(sec, bg=THEME["bg_panel"]); row.pack(fill="x", pady=1)
             tk.Label(row, text=lbl, bg=THEME["bg_panel"], fg=THEME["text_dim"],
                      font=("Consolas",8), width=15, anchor="w").pack(side="left")
@@ -1302,73 +1120,6 @@ class App:
                            bg=THEME["bg_panel"], fg=THEME["text"],
                            selectcolor=THEME["bg_card"], activebackground=THEME["bg_panel"],
                            font=("Consolas",8)).pack(anchor="w", padx=8)
-
-        tk.Checkbutton(
-            sec,
-            text="CUDA Kullan (küçük modelde yavaş olabilir)",
-            variable=self.use_cuda_var,
-            bg=THEME["bg_panel"],
-            fg=THEME["text"],
-            selectcolor=THEME["bg_card"],
-            activebackground=THEME["bg_panel"],
-            font=("Consolas",8),
-        ).pack(anchor="w", padx=8, pady=(6, 0))
-
-        tk.Checkbutton(
-            sec,
-            text="Eğitimde Grid Çiz",
-            variable=self.render_grid_train_var,
-            bg=THEME["bg_panel"],
-            fg=THEME["text"],
-            selectcolor=THEME["bg_card"],
-            activebackground=THEME["bg_panel"],
-            font=("Consolas",8),
-        ).pack(anchor="w", padx=8, pady=(6, 0))
-
-        tk.Checkbutton(
-            sec,
-            text="Eğitimde GIF Frame Kaydet",
-            variable=self.capture_gif_train_var,
-            bg=THEME["bg_panel"],
-            fg=THEME["text"],
-            selectcolor=THEME["bg_card"],
-            activebackground=THEME["bg_panel"],
-            font=("Consolas",8),
-        ).pack(anchor="w", padx=8, pady=(4, 0))
-
-        nrow = tk.Frame(sec, bg=THEME["bg_panel"])
-        nrow.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Label(nrow, text="Model Adı:", bg=THEME["bg_panel"], fg=THEME["text_dim"],
-                 font=("Consolas",8), width=14, anchor="w").pack(side="left")
-        tk.Entry(nrow, textvariable=self.model_name_var, width=16, bg=THEME["bg_card"], fg=THEME["text"],
-                 insertbackground=THEME["accent"], relief="flat", font=("Consolas",8),
-                 highlightthickness=1, highlightbackground=THEME["border"],
-                 highlightcolor=THEME["accent"]).pack(side="left", padx=(0, 4))
-
-        mrow = tk.Frame(sec, bg=THEME["bg_panel"])
-        mrow.pack(fill="x", padx=8, pady=(4, 0))
-        tk.Label(mrow, text="Return Margin:", bg=THEME["bg_panel"], fg=THEME["text_dim"],
-                 font=("Consolas",8), width=14, anchor="w").pack(side="left")
-        tk.Entry(mrow, textvariable=self.return_margin_var, width=6, bg=THEME["bg_card"], fg=THEME["text"],
-                 insertbackground=THEME["accent"], relief="flat", font=("Consolas",8),
-                 highlightthickness=1, highlightbackground=THEME["border"],
-                 highlightcolor=THEME["accent"]).pack(side="left")
-
-    def _build_model_load_section(self, parent):
-        sec = self._section(parent, "📦 MODEL YÜKLE", pady=6)
-        row = tk.Frame(sec, bg=THEME["bg_panel"])
-        row.pack(fill="x", pady=(2, 4))
-        tk.Label(row, text="Model İsmi:", bg=THEME["bg_panel"], fg=THEME["text_dim"],
-                 font=("Consolas",8), width=14, anchor="w").pack(side="left")
-        tk.Entry(row, textvariable=self.load_model_name_var, width=16, bg=THEME["bg_card"], fg=THEME["text"],
-                 insertbackground=THEME["accent"], relief="flat", font=("Consolas",8),
-                 highlightthickness=1, highlightbackground=THEME["border"],
-                 highlightcolor=THEME["accent"]).pack(side="left", padx=(0, 4))
-        tk.Button(sec, text="📥 Model Yükle", command=self._on_load_model,
-                  bg=THEME["bg_card"], fg=THEME["accent3"],
-                  font=("Consolas",9,"bold"), relief="flat", bd=0, pady=4,
-                  cursor="hand2", activebackground=THEME["border"],
-                  activeforeground=THEME["accent3"]).pack(fill="x", padx=2, pady=2)
 
     def _build_buttons(self, parent):
         sec = self._section(parent, "🎮 KONTROLLER", pady=6)
@@ -1530,24 +1281,15 @@ class App:
     def _set_status(self, msg):
         self.status_var.set(msg); self.root.update_idletasks()
 
-    def _start_new_run_identity(self):
-        manual_name = self.model_name_var.get().strip()
-        self.model_name = manual_name if manual_name else make_model_name()
-        self.model_name_slug = _slugify(self.model_name)
-        self.run_id = f"{self.model_name_slug}_{make_run_id()}"
-
-    def _log_current_run(self, msg):
-        log_run_event(self.run_id, msg)
-
     def _update_summary(self):
-        n = self.summary_totals["episodes"]
-        if n == 0: return
-        sr  = self.summary_totals["success"] / n
-        ar  = self.summary_totals["reward"] / n
-        ast = self.summary_totals["steps"] / n
-        ae  = self.summary_totals["energy"] / n
-        ac  = self.summary_totals["charge_visits"] / n
-        text = (f"Toplam Episode: {n}\nBaşarı Oranı:   {sr*100:.1f}%\n"
+        if not self.episode_data: return
+        d = self.episode_data
+        sr  = np.mean([x["success"] for x in d])
+        ar  = np.mean([x["reward"]  for x in d])
+        ast = np.mean([x["steps"]   for x in d])
+        ae  = np.mean([x["energy"]  for x in d])
+        ac  = np.mean([x["charge_visits"] for x in d])
+        text = (f"Toplam Episode: {len(d)}\nBaşarı Oranı:   {sr*100:.1f}%\n"
                 f"Ort. Ödül:      {ar:.2f}\nOrt. Adım:      {ast:.1f}\n"
                 f"Ort. Enerji:    {ae:.1f}\nOrt. Şarj Dön.: {ac:.2f}\n")
         self.summary_text.config(state="normal"); self.summary_text.delete("1.0","end")
@@ -1557,34 +1299,18 @@ class App:
 
     def _initialize_env_agent(self):
         hp          = self._get_hp()
-        hp["use_cuda"] = bool(self.use_cuda_var.get())
         obstacles   = self._get_obstacles()
-        return_margin = int(self.return_margin_var.get()) if str(self.return_margin_var.get()).strip() else RETURN_SAFETY_MARGIN
         use_ddqn    = self.model_var.get()=="DDQN"
-        self.env    = CleaningEnv(obstacles=obstacles, return_safety_margin=return_margin)
+        self.env    = CleaningEnv(obstacles=obstacles)
         self.agent  = DQNAgent(self.env.state_dim, self.env.action_dim, hp, use_ddqn=use_ddqn)
-        self._start_new_run_identity()
+        self.run_id = make_run_id()
         self.episode_data = []
-        self.summary_totals = {
-            "episodes": 0,
-            "success": 0.0,
-            "reward": 0.0,
-            "steps": 0.0,
-            "energy": 0.0,
-            "charge_visits": 0.0,
-        }
         self.chart_mgr.reset()
         self.env.reset(); self._draw_grid(self.env.get_grid_info())
         self.step_label_var.set("Adım: 0  |  Episode: 0")
         self._clear_info_panel(); self._clear_summary_panel()
         self.chart_mgr.update_all(); self._update_control_states()
-        self._set_status(
-            f"✅ Hazır. Algoritma: {self.agent.algorithm_name} | Ad: {self.model_name} | Cihaz: {self.agent.device.type.upper()} | State dim: {self.env.state_dim}"
-        )
-        if "model_name" in self.info_labels:
-            self.info_labels["model_name"].config(text=self.model_name)
-        if "algorithm" in self.info_labels:
-            self.info_labels["algorithm"].config(text=self.agent.algorithm_name)
+        self._set_status(f"✅ Hazır. Model: {self.model_var.get()} | State dim: {self.env.state_dim}")
 
     def _on_initialize(self):
         try: self._initialize_env_agent()
@@ -1596,16 +1322,8 @@ class App:
         if not self.agent or not self.env: self._initialize_env_agent()
         self.stop_flag  = [False]
         self.is_training = True
-        self._start_new_run_identity()
         self._update_control_states(); self._set_status("🏃 Eğitim başladı...")
         hp = self._get_hp(); n = int(hp.get("n_episodes",1000)); ep_start = len(self.episode_data)
-        self.current_train_hp = dict(hp)
-        self.current_train_hp["return_safety_margin"] = int(self.return_margin_var.get())
-        self.current_train_hp["obstacle_map"] = self.obstacle_var.get()
-        self._log_current_run(
-            f"train_start model={self.model_var.get()} algorithm={self.agent.algorithm_name} name={self.model_name} episodes={n} "
-            f"obstacle_map={self.obstacle_var.get()}"
-        )
 
         def callback(ep_idx, info, grid_info):
             self.root.after(0, lambda g=grid_info,i=info,e=ep_idx: self._on_episode_result(g,i,e))
@@ -1613,8 +1331,7 @@ class App:
         def train_thread():
             try:
                 run_episodes(self.agent, self.env, n, hp, callback=callback,
-                             stop_flag=self.stop_flag, train_mode=True, episode_start=ep_start,
-                             run_id=self.run_id, log_cb=self._log_current_run)
+                             stop_flag=self.stop_flag, train_mode=True, episode_start=ep_start)
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Hata",str(e)))
             finally:
@@ -1625,236 +1342,50 @@ class App:
 
     def _on_episode_result(self, grid_info, info, ep_idx):
         self.episode_data.append(info)
-        try:
-            append_episode_params_log(
-                self.run_id,
-                info,
-                self.current_train_hp,
-                self.model_name,
-                self.model_var.get(),
-                self.obstacle_var.get(),
-            )
-        except Exception as e:
-            self._log_current_run(f"episode_param_log_error: {e}")
-        self.summary_totals["episodes"] += 1
-        self.summary_totals["success"] += float(info.get("success", 0.0))
-        self.summary_totals["reward"] += float(info.get("reward", 0.0))
-        self.summary_totals["steps"] += float(info.get("steps", 0.0))
-        self.summary_totals["energy"] += float(info.get("energy", 0.0))
-        self.summary_totals["charge_visits"] += float(info.get("charge_visits", 0.0))
         self.chart_mgr.add_episode(info)
-        self._update_train_ui(
-            grid_info,
-            info,
-            ep_idx,
-            draw_grid=bool(self.render_grid_train_var.get()),
-            update_charts=True,
-            update_summary=True,
-            update_status=(ep_idx % 10 == 0),
-        )
+        self._update_train_ui(grid_info, info, ep_idx, update_charts=(ep_idx % 2 == 0))
 
-    def _update_train_ui(self, grid_info, info, ep_idx, update_charts=True,
-                         update_summary=True, update_status=True, draw_grid=True):
-        if draw_grid:
-            self._draw_grid(grid_info)
-        else:
-            self.battery_bar_var.set(f"⚡ {grid_info['battery']}/{grid_info['max_battery']}")
-            self.cleaned_bar_var.set(f"🧹 {grid_info['visited_count']}/{grid_info['cleanable_count']}")
+    def _update_train_ui(self, grid_info, info, ep_idx, update_charts=True):
+        self._draw_grid(grid_info)
         sr = np.mean([d["success"] for d in self.episode_data[-50:]]) if self.episode_data else 0
         info["success_rate"] = f"{sr*100:.1f}%"
         info["battery"]      = f"{grid_info['battery']}/{grid_info['max_battery']}"
         info["cleaned"]      = f"{grid_info['visited_count']}/{grid_info['cleanable_count']}"
-        info["model_name"]   = self.model_name
-        info["algorithm"]    = self.agent.algorithm_name if self.agent else self.model_var.get()
         self._update_info(info)
         self.step_label_var.set(f"Adım: {info['steps']}  |  Episode: {info['episode']}")
         if update_charts:
-            capture_frames = bool(self.capture_gif_train_var.get()) and (ep_idx % 20 == 0)
-            self.chart_mgr.update_all(self.run_id, capture_frame=capture_frames)
-        if update_summary:
-            self._update_summary()
-        if update_status:
-            self._set_status(f"🏃 Eğitim devam ediyor... Episode {info['episode']}")
+            self.chart_mgr.update_all(self.run_id, capture_frame=(ep_idx%20==0))
+        self._update_summary()
+        self._set_status(f"🏃 Eğitim devam ediyor... Episode {info['episode']}")
 
     def _on_train_done(self):
         self.is_training = False; self._update_control_states()
-        stop_reason = getattr(self.agent, "last_stop_reason", "unknown")
-        self._set_status(f"✅ Eğitim tamamlandı! ({len(self.episode_data)} episode) | Neden: {stop_reason}")
+        self._set_status(f"✅ Eğitim tamamlandı! ({len(self.episode_data)} episode)")
         self._update_summary(); self.chart_mgr.update_all(self.run_id, capture_frame=True)
         try:
             save_episode_log(self.run_id, self.episode_data)
             mp = MODEL_DIR/f"model_{self.run_id}.pt"
             self.agent.save(str(mp)); self.chart_mgr.save_gifs(self.run_id)
-            self._log_current_run(f"artifacts_saved model_path={mp.name}")
-            self._set_status(f"✅ Tamamlandı. Model: {mp.name} | Ad: {self.model_name}")
+            self._set_status(f"✅ Tamamlandı. Model: {mp.name}")
         except Exception as e: self._set_status(f"⚠️ Kayıt hatası: {e}")
 
     def _on_n_episode_run(self):
         if self.is_training: messagebox.showwarning("Uyarı","Eğitim devam ediyor!"); return
         if not self.agent or not self.env: self._initialize_env_agent()
         hp = self._get_hp(); n = min(int(hp.get("n_episodes",50)), 100); ep_start = len(self.episode_data)
-        self.current_train_hp = dict(hp)
-        self.current_train_hp["return_safety_margin"] = int(self.return_margin_var.get())
-        self.current_train_hp["obstacle_map"] = self.obstacle_var.get()
         self.stop_flag=[False]; self.is_training=True
-        self._start_new_run_identity()
         self._update_control_states(); self._set_status(f"⏩ {n} episode...")
-        self._log_current_run(
-            f"n_episode_start model={self.model_var.get()} name={self.model_name} episodes={n} "
-            f"obstacle_map={self.obstacle_var.get()}"
-        )
 
         def callback(ep_idx,info,grid_info):
             self.root.after(0,lambda g=grid_info,i=info,e=ep_idx: self._on_episode_result(g,i,e))
         def run_thread():
             try: run_episodes(self.agent,self.env,n,hp,callback=callback,
-                              stop_flag=self.stop_flag,train_mode=True,episode_start=ep_start,
-                              run_id=self.run_id, log_cb=self._log_current_run)
+                              stop_flag=self.stop_flag,train_mode=False,episode_start=ep_start)
             finally: self.root.after(0,self._on_n_run_done)
         self.train_thread=threading.Thread(target=run_thread,daemon=True); self.train_thread.start()
 
     def _on_n_run_done(self):
-        self.is_training=False; self._update_control_states()
-        stop_reason = getattr(self.agent, "last_stop_reason", "unknown")
-        self._set_status(f"✅ N Episode eğitimi tamamlandı. Neden: {stop_reason}")
-
-    def _reset_summary_totals(self):
-        self.summary_totals = {
-            "episodes": 0,
-            "success": 0.0,
-            "reward": 0.0,
-            "steps": 0.0,
-            "energy": 0.0,
-            "charge_visits": 0.0,
-        }
-
-    def _extract_model_name_from_run_id(self, run_id):
-        m = re.match(r"^(.*)_\d{8}_\d{6}$", run_id)
-        if m:
-            return m.group(1)
-        return run_id
-
-    def _restore_metrics_from_episode_rows(self, rows):
-        self.episode_data = []
-        self.chart_mgr.reset()
-        self._reset_summary_totals()
-        for row in rows:
-            info = {
-                "episode": int(row.get("episode", 0) or 0),
-                "reward": float(row.get("reward", 0.0) or 0.0),
-                "steps": int(float(row.get("steps", 0) or 0)),
-                "energy": float(row.get("energy", 0.0) or 0.0),
-                "charge_visits": float(row.get("charge_visits", 0.0) or 0.0),
-                "cleaned_cells": int(float(row.get("cleaned_cells", 0) or 0)),
-                "success": int(float(row.get("success", 0) or 0)),
-                "epsilon": float(row.get("epsilon", 0.0) or 0.0),
-                "blocked": int(float(row.get("blocked", 0) or 0)),
-                "battery_dead": int(float(row.get("battery_dead", 0) or 0)),
-                "time_since_start_sec": float(row.get("time_since_start_sec", 0.0) or 0.0),
-                "episode_chunk_time_sec": float(row.get("episode_chunk_time_sec", 0.0) or 0.0),
-                "stop_reason": row.get("stop_reason", "") or "",
-            }
-            self.episode_data.append(info)
-            self.summary_totals["episodes"] += 1
-            self.summary_totals["success"] += float(info.get("success", 0.0))
-            self.summary_totals["reward"] += float(info.get("reward", 0.0))
-            self.summary_totals["steps"] += float(info.get("steps", 0.0))
-            self.summary_totals["energy"] += float(info.get("energy", 0.0))
-            self.summary_totals["charge_visits"] += float(info.get("charge_visits", 0.0))
-            self.chart_mgr.add_episode(info)
-        self.chart_mgr.update_all(self.run_id, capture_frame=False)
-        self._update_summary()
-
-    def _on_load_model(self):
-        if self.is_training or self.is_testing:
-            messagebox.showwarning("Uyarı", "Yükleme için önce çalışan işlemi durdurun.")
-            return
-        query = self.load_model_name_var.get().strip()
-        if not query:
-            messagebox.showwarning("Uyarı", "Yüklenecek model adını girin.")
-            return
-
-        q_slug = _slugify(query)
-        candidates = sorted(MODEL_DIR.glob("model_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        model_path = None
-        for p in candidates:
-            run_id = p.stem.replace("model_", "", 1)
-            if query in run_id or q_slug in run_id:
-                model_path = p
-                break
-        if model_path is None:
-            messagebox.showerror("Hata", f"Model bulunamadı: {query}")
-            return
-
-        loaded_run_id = model_path.stem.replace("model_", "", 1)
-        ck = torch.load(model_path, map_location="cpu")
-        loaded_hp = ck.get("hp", {})
-        loaded_use_ddqn = bool(ck.get("use_ddqn", True))
-
-        params_csv = LOG_DIR / f"run_{loaded_run_id}_episode_params.csv"
-        params_rows = load_episode_log(params_csv)
-        if params_rows:
-            p0 = params_rows[0]
-            for k, v in p0.items():
-                if str(k).startswith("hp_"):
-                    loaded_hp[str(k)[3:]] = v
-
-        for key, var in self.hp_vars.items():
-            if key in loaded_hp:
-                try:
-                    var.set(loaded_hp[key])
-                except Exception:
-                    pass
-
-        if "return_safety_margin" in loaded_hp:
-            try:
-                self.return_margin_var.set(int(loaded_hp.get("return_safety_margin", RETURN_SAFETY_MARGIN)))
-            except Exception:
-                self.return_margin_var.set(RETURN_SAFETY_MARGIN)
-        else:
-            self.return_margin_var.set(RETURN_SAFETY_MARGIN)
-
-        obstacle_name = str(loaded_hp.get("obstacle_map", "")).strip()
-        if obstacle_name in OBSTACLE_MAPS:
-            self.obstacle_var.set(obstacle_name)
-
-        self.model_var.set("DDQN" if loaded_use_ddqn else "DQN")
-        self.model_name = self._extract_model_name_from_run_id(loaded_run_id)
-        self.model_name_slug = _slugify(self.model_name)
-        self.model_name_var.set(self.model_name)
-
-        self._initialize_env_agent()
-        self.agent.load(str(model_path))
-
-        self.run_id = loaded_run_id
-        self.current_train_hp = dict(loaded_hp)
-        self.current_train_hp["return_safety_margin"] = int(self.return_margin_var.get())
-        if obstacle_name:
-            self.current_train_hp["obstacle_map"] = obstacle_name
-
-        episode_csv = LOG_DIR / f"run_{loaded_run_id}_episodes.csv"
-        rows = load_episode_log(episode_csv)
-        if rows:
-            self._restore_metrics_from_episode_rows(rows)
-            last = self.episode_data[-1]
-            grid_info = self.env.get_grid_info()
-            last_info = dict(last)
-            sr = np.mean([d["success"] for d in self.episode_data[-50:]]) if self.episode_data else 0
-            last_info["success_rate"] = f"{sr*100:.1f}%"
-            last_info["battery"] = f"{grid_info['battery']}/{grid_info['max_battery']}"
-            last_info["cleaned"] = f"{grid_info['visited_count']}/{grid_info['cleanable_count']}"
-            last_info["model_name"] = self.model_name
-            self._update_info(last_info)
-            self.step_label_var.set(f"Adım: {int(last.get('steps', 0))}  |  Episode: {int(last.get('episode', 0))}")
-        else:
-            self._reset_summary_totals()
-            self._clear_summary_panel()
-            self.chart_mgr.reset()
-            self.chart_mgr.update_all(self.run_id, capture_frame=False)
-
-        if "model_name" in self.info_labels:
-            self.info_labels["model_name"].config(text=self.model_name)
-        self._set_status(f"✅ Model yüklendi: {model_path.name} | Ad: {self.model_name}")
+        self.is_training=False; self._update_control_states(); self._set_status("✅ N Episode tamamlandı.")
 
     def _on_test(self):
         if self.is_training or self.is_testing:
@@ -1866,11 +1397,12 @@ class App:
         self._draw_grid(self.env.get_grid_info()); self._set_status("🧪 Test görselleştirmesi...")
 
         def test_step(step_n,state):
-            if self.stop_flag[0] or self.env.done or self.env.step_count >= self.env.max_steps:
+            if self.stop_flag[0] or self.env.done or step_n>500:
                 self.is_testing=False; self._update_control_states()
                 self._set_status(f"✅ Test bitti. Temizlenen: {self.env.visited_count}/{self.env.cleanable_count}")
                 return
-            action=select_policy_action(self.agent, self.env, state, force_greedy=True)
+            orig=self.agent.epsilon; self.agent.epsilon=0.0
+            action=self.agent.select_action(state); self.agent.epsilon=orig
             next_state,reward,done,info=self.env.step(action)
             self._draw_grid(self.env.get_grid_info())
             self.step_label_var.set(f"Adım: {self.env.step_count}  |  Ödül: {reward:.2f}")
@@ -1899,7 +1431,6 @@ class App:
         if not messagebox.askyesno("HP Arama","Hiperparametre araması başlatılsın mı?"): return
 
         base_hp      = self._get_hp()
-        base_hp["use_cuda"] = bool(self.use_cuda_var.get())
         use_ddqn     = self.model_var.get()=="DDQN"
         obstacles    = self._get_obstacles()
         env_kwargs   = {"obstacles": obstacles}
@@ -1914,35 +1445,19 @@ class App:
         pb = ttk.Progressbar(pw,length=350,mode="determinate"); pb.pack(pady=5)
         rt = tk.Text(pw,bg=THEME["bg_card"],fg=THEME["text"],font=("Consolas",8),height=18,relief="flat")
         rt.pack(fill="both",expand=True,padx=10,pady=5)
-        hp_keys = list(HP_SEARCH_SPACE.keys())
-        best_score_ref = {"score": -float("inf")}
-
-        def _format_result(result):
-            params = ", ".join(f"{k}={result.get(k, '—')}" for k in hp_keys)
-            metrics = (
-                f"score={result.get('score','—')} | sr={result.get('success_rate','—')} | "
-                f"avg_r={result.get('avg_reward','—')} | avg_e={result.get('avg_energy','—')} | "
-                f"eps={result.get('n_episodes','—')}"
-            )
-            return params, metrics
 
         def progress_cb(done,total,result):
             self.root.after(0,lambda d=done,t=total,r=result: _apply(d,t,r))
         def _apply(done,total,result):
             pb["value"]=done/total*100; pl.config(text=f"Kombinasyon {done}/{total}")
-            params, metrics = _format_result(result)
-            rt.insert("end",f"[{done}] {metrics}\n")
-            rt.insert("end",f"      {params}\n")
-            rt.see("end")
-            cur_score = float(result.get("score", -1e9))
-            if cur_score > best_score_ref["score"]:
-                best_score_ref["score"] = cur_score
-                bv.set(f"En iyi -> {metrics}\n{params}")
+            rt.insert("end",f"[{done}] score={result.get('score','—')} sr={result.get('success_rate','—')} lr={result.get('learning_rate','—')}\n"); rt.see("end")
+            if float(result.get("score",-1e9)) > float(bv.get().split("=")[-1] if "=" in bv.get() else "-1e9"):
+                bv.set(f"En iyi: score={result.get('score','—')} sr={result.get('success_rate','—')}")
 
         def search_thread():
             try:
                 best_hp,all_results = hp_search(base_hp,env_kwargs,use_ddqn=use_ddqn,
-                                                 training_budget_steps=10000,eval_window=100,
+                                                 training_budget_steps=50000,eval_window=100,
                                                  progress_cb=progress_cb,stop_flag=self.stop_flag)
                 self.root.after(0,lambda: self._on_hp_search_done(best_hp,all_results,pw))
             except Exception as e:

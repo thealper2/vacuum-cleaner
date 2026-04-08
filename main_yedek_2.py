@@ -423,19 +423,29 @@ class CleaningEnv:
 
 def build_network(state_dim, action_dim, hidden1, hidden2):
     """
-    Standart Q-network (MLP).
-    Double DQN mantığı train_step içinde hedef hesaplama sırasında korunur.
+    Dueling DQN mimarisi: avantaj ve değer akışları ayrı.
+    56 boyutlu state için daha güçlü temsil.
     """
-    class QNet(nn.Module):
+    class DuelingNet(nn.Module):
         def __init__(self):
             super().__init__()
-            self.net = nn.Sequential(
+            # Ortak özellik çıkarıcı
+            self.shared = nn.Sequential(
                 nn.Linear(state_dim, hidden1),
                 nn.LayerNorm(hidden1),
                 nn.ReLU(),
                 nn.Linear(hidden1, hidden2),
                 nn.LayerNorm(hidden2),
                 nn.ReLU(),
+            )
+            # Değer akışı (V)
+            self.value_stream = nn.Sequential(
+                nn.Linear(hidden2, hidden2 // 2),
+                nn.ReLU(),
+                nn.Linear(hidden2 // 2, 1),
+            )
+            # Avantaj akışı (A)
+            self.advantage_stream = nn.Sequential(
                 nn.Linear(hidden2, hidden2 // 2),
                 nn.ReLU(),
                 nn.Linear(hidden2 // 2, action_dim),
@@ -449,9 +459,13 @@ def build_network(state_dim, action_dim, hidden1, hidden2):
                     nn.init.zeros_(m.bias)
 
         def forward(self, x):
-            return self.net(x)
+            feat = self.shared(x)
+            v    = self.value_stream(feat)
+            a    = self.advantage_stream(feat)
+            # Q = V + (A - mean(A))  →  daha stabil öğrenme
+            return v + (a - a.mean(dim=1, keepdim=True))
 
-    return QNet()
+    return DuelingNet()
 
 
 # ─────────────────────────────────────────────
@@ -522,19 +536,6 @@ class DQNAgent:
         self.episode_count = 0
         self.losses: List[float] = []
 
-    @property
-    def algorithm_name(self):
-        return "DDQN" if self.use_ddqn else "DQN"
-
-    def _compute_next_q_ddqn(self, next_states):
-        # Double DQN: aksiyon seçimi online ağdan, değerleme target ağdan yapılır.
-        next_actions = self.q_net(next_states).argmax(1)
-        return self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-
-    def _compute_next_q_dqn(self, next_states):
-        # Vanilla DQN: hedef Q, doğrudan target ağın max Q çıktısıdır.
-        return self.target_net(next_states).max(1)[0]
-
     def select_action(self, state):
         if random.random() < self.epsilon:
             return random.randrange(self.action_dim)
@@ -565,9 +566,10 @@ class DQNAgent:
 
         with torch.no_grad():
             if self.use_ddqn:
-                next_q = self._compute_next_q_ddqn(ns)
+                next_actions = self.q_net(ns).argmax(1)
+                next_q = self.target_net(ns).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             else:
-                next_q = self._compute_next_q_dqn(ns)
+                next_q = self.target_net(ns).max(1)[0]
             target = r + float(hp["gamma"]) * next_q * (1-d)
 
         if getattr(self.replay, "is_prioritized", False):
@@ -1256,7 +1258,7 @@ class App:
                           ("energy","Enerji:"),("charge_visits","Şarj Dönüşü:"),
                           ("success_rate","Başarı Oranı:"),("epsilon","Epsilon:"),
                           ("battery","Batarya:"),("cleaned","Temizlenen:"),
-                          ("model_name","Model Adı:"),("algorithm","Algoritma:")]:
+                          ("model_name","Model Adı:")]:
             row = tk.Frame(sec, bg=THEME["bg_panel"]); row.pack(fill="x", pady=1)
             tk.Label(row, text=lbl, bg=THEME["bg_panel"], fg=THEME["text_dim"],
                      font=("Consolas",8), width=15, anchor="w").pack(side="left")
@@ -1579,12 +1581,10 @@ class App:
         self._clear_info_panel(); self._clear_summary_panel()
         self.chart_mgr.update_all(); self._update_control_states()
         self._set_status(
-            f"✅ Hazır. Algoritma: {self.agent.algorithm_name} | Ad: {self.model_name} | Cihaz: {self.agent.device.type.upper()} | State dim: {self.env.state_dim}"
+            f"✅ Hazır. Model: {self.model_var.get()} | Ad: {self.model_name} | Cihaz: {self.agent.device.type.upper()} | State dim: {self.env.state_dim}"
         )
         if "model_name" in self.info_labels:
             self.info_labels["model_name"].config(text=self.model_name)
-        if "algorithm" in self.info_labels:
-            self.info_labels["algorithm"].config(text=self.agent.algorithm_name)
 
     def _on_initialize(self):
         try: self._initialize_env_agent()
@@ -1603,7 +1603,7 @@ class App:
         self.current_train_hp["return_safety_margin"] = int(self.return_margin_var.get())
         self.current_train_hp["obstacle_map"] = self.obstacle_var.get()
         self._log_current_run(
-            f"train_start model={self.model_var.get()} algorithm={self.agent.algorithm_name} name={self.model_name} episodes={n} "
+            f"train_start model={self.model_var.get()} name={self.model_name} episodes={n} "
             f"obstacle_map={self.obstacle_var.get()}"
         )
 
@@ -1665,7 +1665,6 @@ class App:
         info["battery"]      = f"{grid_info['battery']}/{grid_info['max_battery']}"
         info["cleaned"]      = f"{grid_info['visited_count']}/{grid_info['cleanable_count']}"
         info["model_name"]   = self.model_name
-        info["algorithm"]    = self.agent.algorithm_name if self.agent else self.model_var.get()
         self._update_info(info)
         self.step_label_var.set(f"Adım: {info['steps']}  |  Episode: {info['episode']}")
         if update_charts:
