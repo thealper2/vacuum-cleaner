@@ -800,6 +800,9 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
     debug_battery_dead_count = 0
     debug_blocked_count = 0
     success_history = []
+    best_success = -float("inf")
+    best_weights = None
+    best_success_episode = None
 
     for ep in range(n_episodes):
         ep_t0 = time.perf_counter()
@@ -856,6 +859,8 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
 
         if train_mode:
             agent.decay_epsilon()
+            if (ep + 1) > 2000:
+                agent.epsilon = 0.1
             agent.episode_count += 1
             # PyTorch uyarısını önlemek için: scheduler sadece optimizer en az bir kez çalıştıysa.
             if hasattr(agent, 'scheduler') and getattr(agent, 'optim_steps', 0) > 0:
@@ -906,6 +911,13 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
         episode_data.append(info_dict)
         success_history.append(success)
 
+        success_window = min(len(success_history), 100)
+        success_rate = float(np.mean(success_history[-success_window:])) if success_window > 0 else 0.0
+        if train_mode and success_rate > best_success:
+            best_success = success_rate
+            best_weights = copy.deepcopy(agent.q_net.state_dict())
+            best_success_episode = episode_start + ep + 1
+
         if (
             success_early_stop
             and train_mode
@@ -926,6 +938,9 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
 
     setattr(agent, "last_stop_reason", stop_reason)
     setattr(agent, "last_stop_episode", episode_start + len(episode_data))
+    setattr(agent, "best_success", None if best_success == -float("inf") else best_success)
+    setattr(agent, "best_weights", best_weights)
+    setattr(agent, "best_success_episode", best_success_episode)
     if log_cb:
         elapsed = time.perf_counter() - run_t0
         log_cb(
@@ -1683,6 +1698,13 @@ class App:
         self._update_summary(); self.chart_mgr.update_all(self.run_id, capture_frame=True)
         try:
             save_episode_log(self.run_id, self.episode_data)
+            if getattr(self.agent, "best_weights", None) is not None:
+                self.agent.q_net.load_state_dict(self.agent.best_weights)
+                self.agent.target_net.load_state_dict(self.agent.best_weights)
+                self._log_current_run(
+                    f"best_weights_loaded best_success={getattr(self.agent, 'best_success', None)} "
+                    f"best_episode={getattr(self.agent, 'best_success_episode', None)}"
+                )
             mp = MODEL_DIR/f"model_{self.run_id}.pt"
             self.agent.save(str(mp)); self.chart_mgr.save_gifs(self.run_id)
             self._log_current_run(f"artifacts_saved model_path={mp.name}")
