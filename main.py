@@ -75,23 +75,23 @@ THEME = {
 }
 
 DEFAULT_HP = {
-    "n_episodes":         6000,      # 10k gereksiz, 6k yeter
-    "learning_rate":      1e-3,      # daha hızlı öğrenir
-    "gamma":              0.97,      # uzun vadeyi biraz azalt (çok önemli)
-    "batch_size":         128,       # stabilite
-    "buffer_size":        50000,     # yeterli
-    "min_replay_size":    3000,      # çok bekleme
+    "n_episodes":         6000,
+    "learning_rate":      1e-3,
+    "gamma":              0.97,
+    "batch_size":         128,
+    "buffer_size":        50000,
+    "min_replay_size":    3000,
 
     "hidden1":            256,
     "hidden2":            128,
 
     "target_update_freq": 200,
-    "train_freq":         2,         # overfit'i azaltır
+    "train_freq":         2,
     "clip_grad":          5.0,
 
     "epsilon_start":      1.0,
     "epsilon_min":        0.05,
-    "epsilon_decay":      0.9993,    # daha yavaş decay (KRİTİK)
+    "epsilon_decay":      0.9993,
 
     "reward_scale":       1.0,
     "stop_reward":        200.0,
@@ -181,17 +181,24 @@ def get_tile(name):
 
 
 # ─────────────────────────────────────────────
-# ORTAM  ← BÜYÜK DÜZELTME
+# ORTAM  ← YENİDEN YAZILDI
 # ─────────────────────────────────────────────
 
 class CleaningEnv:
     """
-    DÜZELTİLMİŞ ORTAM:
-    - State vektörü artık grid'in 2D dirty-map'ini + robot konumunu + bataryayı içeriyor
-    - Ödül şekillendirmesi düzgün yapılmış
-    - Batarya yönetimi mantıklı
-    - MAX_BATTERY=16 ile çözülebilir: şarj istasyonundan en uzak hücre 6 adım,
-      robot turlar halinde (git-temizle-dön-şarj) çalışmalı
+    YENİDEN YAZILMIŞ ORTAM:
+    State Space (107 boyut):
+      - Robot pozisyonu (2): normalize edilmiş [r, c]
+      - Batarya (1): normalize edilmiş
+      - Dirty map (49): binary 7x7 flatten, 1=kirli
+      - Visited map (49): binary 7x7 flatten, 1=ziyaret edildi
+      - Scalar features (6):
+          dist_to_charge, remaining_dirt_ratio,
+          can_return_flag, dx_to_charge, dy_to_charge,
+          steps_norm
+    Toplam: 2 + 1 + 49 + 49 + 6 = 107
+
+    Ödül Fonksiyonu: detaylı progress-based shaping
     """
 
     def __init__(self, grid_size=7, charge_pos=(3,3), max_battery=MAX_BATTERY,
@@ -214,109 +221,127 @@ class CleaningEnv:
         self.robot_pos      = self.charge_pos
         self.battery        = self.max_battery
         self.cleaned        = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        self.visited_map    = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
         self.dirty_cells    = {
             (i, j)
             for i in range(self.grid_size)
             for j in range(self.grid_size)
             if (i, j) != self.charge_pos and (i, j) not in self.obstacles
         }
-        self.visited_count  = 0
-        self.charge_visits  = 0
-        self.total_energy   = 0
-        self.step_count     = 0
-        self.done           = False
-        self.episode_reward = 0.0
+        # Dirty map: 1=kirli, 0=temiz veya engel/şarj
+        self.dirty_map      = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)
+        for (i, j) in self.dirty_cells:
+            self.dirty_map[i, j] = 1.0
+
+        self.visited_count      = 0
+        self.charge_visits      = 0
+        self.total_energy       = 0
+        self.step_count         = 0
+        self.done               = False
+        self.episode_reward     = 0.0
+        self.cleaned_since_last_charge = 0  # Son şarjdan bu yana temizlenen hücre sayısı
+        self._last_progress     = 0.0       # Ödül hesabı için önceki progress
         return self._get_state()
 
-    def _nearest_dirty_dist(self, r: int, c: int) -> float:
-        if not self.dirty_cells:
-            return float(self.grid_size * 2)
-        return float(min(abs(r-i) + abs(c-j) for (i, j) in self.dirty_cells))
+    def _manhattan_dist_to_charge(self, r: int, c: int) -> int:
+        return abs(r - self.charge_pos[0]) + abs(c - self.charge_pos[1])
 
-    # ── STATE (DÜZELTİLMİŞ) ──────────────────
-    # Eski: sadece 6 sayı → robot grid durumunu göremiyordu!
-    # Yeni: robot pozisyonu (2) + batarya (1) + dirty grid (49) + özet istatistikler (3)
-    # Toplam: 55 boyut
+    # ── STATE (YENİDEN YAZILDI - 107 boyut) ──
     def _get_state(self):
         r, c = self.robot_pos
         cr, cc = self.charge_pos
 
-        # 1. Robot pozisyonu (normalize)
-        pos = np.array([r / (self.grid_size-1), c / (self.grid_size-1)], dtype=np.float32)
+        # 1. Robot pozisyonu (normalize) - 2 dim
+        pos = np.array([
+            r / (self.grid_size - 1),
+            c / (self.grid_size - 1)
+        ], dtype=np.float32)
 
-        # Şarj istasyonuna mesafe hesabı
-        real_dist_to_charge = abs(r-cr) + abs(c-cc)
-        dist_to_charge = real_dist_to_charge / (self.grid_size*2)
+        # 2. Batarya (normalize) - 1 dim
+        bat_norm = np.array([self.battery / self.max_battery], dtype=np.float32)
 
-        # 2. Batarya (normalize + kritik bayrak)
-        bat_norm = self.battery / self.max_battery
-        bat_crit = 1.0 if self.battery <= real_dist_to_charge + self.return_safety_margin else 0.0
+        # 3. Dirty map (binary, 49 dim): 1=kirli, 0=temiz/engel/şarj
+        dirty_flat = self.dirty_map.flatten()  # 49
 
-        # 3. Dirty grid (7x7=49 hücre, flatten)
-        # 0=kirli, 1=temiz veya engel
-        dirty_map = self.cleaned.copy()
-        for obs in self.obstacles:
-            dirty_map[obs[0], obs[1]] = 1.0  # engeller "temizlenmiş" gibi
-        dirty_flat = dirty_map.flatten()  # 49 boyut
+        # 4. Visited map (binary, 49 dim): 1=ziyaret edildi
+        visited_flat = self.visited_map.flatten()  # 49
 
-        # 4. Şarj istasyonuna mesafe (Zaten hesaplandı)
+        # 5. Scalar features - 6 dim
+        dist_to_charge = self._manhattan_dist_to_charge(r, c)
+        dist_norm = dist_to_charge / (self.grid_size * 2)
 
-        # 5. En yakın kirli hücreye mesafe (manhattan)
-        min_dist = self._nearest_dirty_dist(r, c)
-        nearest_dirty_norm = min_dist / (self.grid_size*2)
-        # Ekstra: Durum değişimi için eski min_dist'i bir yere kaydetmiyoruz, ama 
-        # robot bu sayede kirlinin nerede olduğunu doğrudan sayısal olarak da hissedebilir.
+        # Remaining dirt ratio
+        remaining_dirt = len(self.dirty_cells) / max(1, self.cleanable_count)
 
-        # 6. Temizlenme oranı
-        clean_ratio = self.visited_count / max(1, self.cleanable_count)
+        # Can return flag: batarya, şarj mesafesine yetecek mi?
+        can_return = 1.0 if self.battery >= dist_to_charge else 0.0
 
-        return_need = 1.0 if self.battery <= real_dist_to_charge + self.return_safety_margin else 0.0
+        # Şarj istasyonuna göre rölatif pozisyon
+        dx = (r - cr) / self.grid_size
+        dy = (c - cc) / self.grid_size
 
-        state = np.concatenate([
-            pos,                             # 2
-            [bat_norm, bat_crit],            # 2
-            dirty_flat,                      # 49
-            [dist_to_charge, nearest_dirty_norm, clean_ratio, return_need],  # 4
-        ]).astype(np.float32)
+        # Normalize adım sayısı
+        steps_norm = self.step_count / self.max_steps
+
+        scalars = np.array([
+            dist_norm,
+            remaining_dirt,
+            can_return,
+            dx,
+            dy,
+            steps_norm,
+        ], dtype=np.float32)
+
+        state = np.concatenate([pos, bat_norm, dirty_flat, visited_flat, scalars]).astype(np.float32)
 
         assert len(state) == self.state_dim, f"State dim mismatch: {len(state)} != {self.state_dim}"
         return state
 
     @property
     def state_dim(self):
-        return 2 + 2 + 49 + 4  # = 57
+        # 2 (pos) + 1 (bat) + 49 (dirty) + 49 (visited) + 6 (scalars) = 107
+        return 2 + 1 + 49 + 49 + 6  # = 107
 
     @property
     def action_dim(self):
         return 4
 
-    # ── STEP (DÜZELTİLMİŞ) ───────────────────
+    def _get_action_mask(self) -> np.ndarray:
+        """Her aksiyon için geçerliliği döndür (1=geçerli, 0=geçersiz/duvar/engel)"""
+        r, c = self.robot_pos
+        mask = np.zeros(4, dtype=np.float32)
+        for a_idx, a_name in enumerate(ACTIONS):
+            dr, dc = ACTION_DELTAS[a_name]
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size and (nr, nc) not in self.obstacles:
+                mask[a_idx] = 1.0
+        return mask
+
+    # ── STEP (YENİDEN YAZILDI) ────────────────
     def step(self, action: int):
         if self.done:
             return self._get_state(), 0.0, True, {}
 
         old_r, old_c = self.robot_pos
-        prev_dist_charge = abs(old_r - self.charge_pos[0]) + abs(old_c - self.charge_pos[1])
+        prev_dist_charge = self._manhattan_dist_to_charge(old_r, old_c)
+        old_progress = self.visited_count / max(1, self.cleanable_count)
 
         action_name = ACTIONS[action]
         dr, dc = ACTION_DELTAS[action_name]
         nr, nc = old_r + dr, old_c + dc
 
-        # Düşük bataryada şarja dönme davranışını zorlayıcı ödülle güçlendir.
-        # Güvenli dönüş için mesafeye bağlı dinamik bir sınır belirle.
-        return_required = self.battery <= prev_dist_charge + self.return_safety_margin
+        # 1️⃣ Adım maliyeti (her zaman uygulanır)
+        reward = -0.1
 
         # Duvar veya engel
         if not (0 <= nr < self.grid_size and 0 <= nc < self.grid_size) \
-                or (nr,nc) in self.obstacles:
-            # Geçersiz hamle de zaman/enerji tüketir; aksi halde testte adım sabit kalıp
-            # ajan aynı duvara vurarak "takılmış" gibi görünür.
+                or (nr, nc) in self.obstacles:
             self.battery     -= 1
             self.total_energy += 1
             self.step_count   += 1
-            reward = -0.5
+
             if self.battery <= 0:
-                reward = -20.0
+                reward = -80.0
                 self.done = True
                 self.episode_reward += reward
                 return self._get_state(), reward, True, {"blocked": True, "battery_dead": True}
@@ -327,68 +352,80 @@ class CleaningEnv:
             self.episode_reward += reward
             return self._get_state(), reward, False, {"blocked": True}
 
-        # Hareket
+        # Hareket gerçekleşti
         self.robot_pos    = (nr, nc)
         self.battery     -= 1
         self.total_energy += 1
         self.step_count   += 1
+        dist_to_charge = self._manhattan_dist_to_charge(nr, nc)
+        margin = self.battery - dist_to_charge
 
-        reward = -0.1  # küçük adım maliyeti
-        prev_min_dist = self._nearest_dirty_dist(old_r, old_c)
-
-        # Yeni temiz hücre
+        # 2️⃣ İlerleme bazlı temizlik ödülü
         if (nr, nc) in self.dirty_cells:
             self.dirty_cells.remove((nr, nc))
-            self.cleaned[nr,nc] = 1.0
-            self.visited_count  += 1
-            reward += 3.0
-            if self.visited_count % 5 == 0:
-                reward += 5.0
-        elif self.cleaned[nr, nc] == 1 and (nr, nc) != self.charge_pos:
-            # Aynı temiz hücrelerde gezinmeyi caydır (loop cezası)
-            reward -= 0.5
+            self.dirty_map[nr, nc] = 0.0
+            self.cleaned[nr, nc]   = 1.0
+            self.visited_map[nr, nc] = 1.0
+            self.visited_count      += 1
+            self.cleaned_since_last_charge += 1
 
-        dist_charge = abs(nr - self.charge_pos[0]) + abs(nc - self.charge_pos[1])
+            new_progress = self.visited_count / max(1, self.cleanable_count)
+            reward += 10.0 * (new_progress - old_progress)
+
+        elif self.visited_map[nr, nc] == 1.0 and (nr, nc) != self.charge_pos:
+            # 3️⃣ Tekrar ziyaret cezası
+            current_progress = self.visited_count / max(1, self.cleanable_count)
+            reward -= (0.5 + 0.5 * current_progress)
 
         # Şarj istasyonu
-        at_charge = (nr,nc) == self.charge_pos
+        at_charge = (nr, nc) == self.charge_pos
         if at_charge:
-            old_battery   = self.battery
-            self.battery  = self.max_battery
-            self.charge_visits += 1
+            old_battery = self.battery
+            bat_ratio = old_battery / self.max_battery
 
-            # Tüm hücreler temizlendi mi? → BAŞARI
+            # 4️⃣ Şarj ödülü: düşük bataryada pozitif, yüksek bataryada negatif
+            if bat_ratio < 0.30:
+                reward += 3.0
+            else:
+                reward -= 1.0
+
+            # 5️⃣ Kısa döngü cezası
+            if self.cleaned_since_last_charge < 3:
+                reward -= 3.0
+
+            # 6️⃣ Derin temizlik teşviki
+            if self.cleaned_since_last_charge >= 5:
+                reward += 2.0
+
+            # Şarj et
+            self.battery = self.max_battery
+            self.charge_visits += 1
+            self.cleaned_since_last_charge = 0
+
+            # 🔟 Başarı durumu: tüm hücreler temizlendi ve şarj istasyonundayız
             if self.visited_count == self.cleanable_count:
-                reward      += 50.0
-                self.done    = True
+                reward += 120.0
+                self.done = True
                 self.episode_reward += reward
                 return self._get_state(), reward, True, {"success": True}
 
-            # Sadece gerekli şarjı ödüllendir; gereksiz şarjı hafif cezalandır.
-            if old_battery < prev_dist_charge + self.return_safety_margin:
-                reward += 0.5
-            else:
-                reward -= 0.5
+        else:
+            # Şarj istasyonunda değilsek
+            # 7️⃣ Şarj mesafesi kısıtı (tehlikeli durum)
+            if margin < 0:
+                reward -= 5.0
+            elif margin < 2:
+                reward -= 2.0
 
-        # Phase-based shaping: tek fazda tek hedef sinyali ver.
-        # Return fazı: batarya kritik veya tüm kirler temizlenmişse şarja yaklaş.
-        return_phase = return_required or (self.visited_count == self.cleanable_count)
-        if return_phase and not at_charge:
-            if dist_charge < prev_dist_charge:
-                reward += 0.5
-            elif dist_charge > prev_dist_charge:
-                reward -= 0.5
-        elif (not return_required) and self.dirty_cells:
-            new_min_dist = self._nearest_dirty_dist(nr, nc)
-            if new_min_dist < prev_min_dist:
-                reward += 0.3
-            elif new_min_dist > prev_min_dist:
-                reward -= 0.3
+            # 8️⃣ Düşük bataryada geri dönüş teşviki
+            bat_ratio = self.battery / self.max_battery
+            if bat_ratio < 0.30 and dist_to_charge < prev_dist_charge:
+                reward += 1.5
 
-        # Batarya bitti
+        # 9️⃣ Batarya bitmesi
         if self.battery <= 0:
-            reward      = -20.0
-            self.done    = True
+            reward = -80.0
+            self.done = True
             self.episode_reward += reward
             return self._get_state(), reward, True, {"battery_dead": True}
 
@@ -418,14 +455,10 @@ class CleaningEnv:
 
 
 # ─────────────────────────────────────────────
-# SİNİR AĞI  ← DÜZELTİLMİŞ
+# SİNİR AĞI
 # ─────────────────────────────────────────────
 
 def build_network(state_dim, action_dim, hidden1, hidden2):
-    """
-    Standart Q-network (MLP).
-    Double DQN mantığı train_step içinde hedef hesaplama sırasında korunur.
-    """
     class QNet(nn.Module):
         def __init__(self):
             super().__init__()
@@ -455,14 +488,10 @@ def build_network(state_dim, action_dim, hidden1, hidden2):
 
 
 # ─────────────────────────────────────────────
-# REPLAY BUFFER (Hızlı Uniform Örnekleme)
+# REPLAY BUFFER
 # ─────────────────────────────────────────────
 
 class PrioritizedReplayBuffer:
-    """
-    Hız odaklı replay buffer.
-    Uniform random.sample kullanır; küçük/orta problemlerde PER'den daha hızlıdır.
-    """
     def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
         self.capacity     = capacity
         self.buffer    = deque(maxlen=capacity)
@@ -473,7 +502,6 @@ class PrioritizedReplayBuffer:
 
     def sample(self, batch_size):
         samples = random.sample(self.buffer, batch_size)
-
         states, actions, rewards, next_states, dones = zip(*samples)
         return (
             np.array(states,      dtype=np.float32),
@@ -493,7 +521,7 @@ class PrioritizedReplayBuffer:
 
 
 # ─────────────────────────────────────────────
-# DQN / DDQN AJAN  ← DÜZELTİLMİŞ
+# DQN / DDQN AJAN
 # ─────────────────────────────────────────────
 
 class DQNAgent:
@@ -501,7 +529,7 @@ class DQNAgent:
         self.state_dim   = state_dim
         self.action_dim  = action_dim
         self.hp          = hp
-        self.use_ddqn    = use_ddqn  # varsayılan True (DDQN daha stabil)
+        self.use_ddqn    = use_ddqn
         use_cuda = bool(hp.get("use_cuda", False))
         self.device      = torch.device(
             device if device else ("cuda" if (use_cuda and torch.cuda.is_available()) else "cpu"))
@@ -527,20 +555,29 @@ class DQNAgent:
         return "DDQN" if self.use_ddqn else "DQN"
 
     def _compute_next_q_ddqn(self, next_states):
-        # Double DQN: aksiyon seçimi online ağdan, değerleme target ağdan yapılır.
         next_actions = self.q_net(next_states).argmax(1)
         return self.target_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
 
     def _compute_next_q_dqn(self, next_states):
-        # Vanilla DQN: hedef Q, doğrudan target ağın max Q çıktısıdır.
         return self.target_net(next_states).max(1)[0]
 
-    def select_action(self, state):
+    def select_action(self, state, action_mask=None):
         if random.random() < self.epsilon:
+            if action_mask is not None:
+                valid = [i for i, m in enumerate(action_mask) if m > 0]
+                return random.choice(valid) if valid else random.randrange(self.action_dim)
             return random.randrange(self.action_dim)
         with torch.no_grad():
             s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            return int(self.q_net(s).argmax().item())
+            q_vals = self.q_net(s).squeeze(0).cpu().numpy()
+            if action_mask is not None:
+                # Geçersiz aksiyonları -inf ile maskele
+                masked_q = q_vals.copy()
+                for i, m in enumerate(action_mask):
+                    if m == 0:
+                        masked_q[i] = -1e9
+                return int(np.argmax(masked_q))
+            return int(np.argmax(q_vals))
 
     def store(self, state, action, reward, next_state, done):
         self.replay.push(state, action, reward, next_state, done)
@@ -550,7 +587,6 @@ class DQNAgent:
         if len(self.replay) < int(hp["min_replay_size"]):
             return None
 
-        # PER örnekleme
         states, actions, rewards, next_states, dones, idxs, weights = \
             self.replay.sample(int(hp["batch_size"]))
 
@@ -725,65 +761,56 @@ def save_hp_search_log(results):
 
 def select_policy_action(agent, env, state, force_greedy=False):
     """
-    Eğitim ve testte aynı aksiyon politikasını kullan.
-    force_greedy=True iken ağdan epsilon=0 ile aksiyon seçilir.
+    DQN ile uyumlu aksiyon seçimi:
+    - Invalid action'lar maskelenir
+    - Keşifte yakın kirli hücrelere hafif öncelik verilir
+    - Q-values üzerinden seçim yapılır
     """
+
+    # --- epsilon ayarı ---
     if force_greedy:
-        orig = agent.epsilon
-        agent.epsilon = 0.0
-        action = agent.select_action(state)
-        agent.epsilon = orig
+        epsilon = 0.0
     else:
-        action = agent.select_action(state)
+        epsilon = agent.epsilon
 
-    # Kritik bataryada, şarja uzaklaştıran adımları engelle.
     rr, rc = env.robot_pos
-    cur_dist = abs(rr - env.charge_pos[0]) + abs(rc - env.charge_pos[1])
-    # Sadece gerçekten acil durumda (mesafe + 1) dönüş dayat.
-    return_required = env.battery <= cur_dist + 1
 
-    valid_actions = []
-    for a_idx, a_name in enumerate(ACTIONS):
-        dr, dc = ACTION_DELTAS[a_name]
-        nr, nc = rr + dr, rc + dc
-        if 0 <= nr < env.grid_size and 0 <= nc < env.grid_size and (nr, nc) not in env.obstacles:
-            valid_actions.append(a_idx)
+    # --- valid actions hesapla (mask ile) ---
+    action_mask = env._get_action_mask()
+    valid_actions = [i for i, m in enumerate(action_mask) if m > 0]
+    if not valid_actions:
+        valid_actions = list(range(env.action_dim))
 
-    # Geçersiz aksiyon seçimini engelle: duvar/engele çarpıp batarya yakmasın.
-    if valid_actions and action not in valid_actions:
-        if force_greedy:
-            with torch.no_grad():
-                s = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
-                q_vals = agent.q_net(s).squeeze(0).detach().cpu().numpy()
-            action = max(valid_actions, key=lambda a: q_vals[a])
+    # --- state tensor ---
+    s = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
+
+    with torch.no_grad():
+        q_vals = agent.q_net(s).squeeze(0).cpu().numpy()
+
+    # --- ACTION MASKING ---
+    # geçersiz aksiyonların Q değerini çok düşür
+    for i, m in enumerate(action_mask):
+        if m == 0:
+            q_vals[i] = -1e9
+
+    # --- epsilon-greedy ---
+    if random.random() < epsilon:
+        # Yakın kirli hücrelere hafif öncelik ver
+        preferred = []
+        for a_idx in valid_actions:
+            dr, dc = ACTION_DELTAS[ACTIONS[a_idx]]
+            nr, nc = rr + dr, rc + dc
+            if (nr, nc) in env.dirty_cells:
+                preferred.append(a_idx)
+        if preferred and random.random() < 0.7:
+            action = random.choice(preferred)
         else:
             action = random.choice(valid_actions)
-
-    # Çok erken şarja dönmeyi engellemek için sadece gerçek kritik bölgede zorla:
-    # kalan batarya, şarja kalan mesafeye eşit/az ise güvenli aksiyon dayat.
-    if return_required:
-        better_actions = []
-        safe_actions = []
-        for a_idx, a_name in enumerate(ACTIONS):
-            dr, dc = ACTION_DELTAS[a_name]
-            nr, nc = rr + dr, rc + dc
-            if not (0 <= nr < env.grid_size and 0 <= nc < env.grid_size):
-                continue
-            if (nr, nc) in env.obstacles:
-                continue
-            new_dist = abs(nr - env.charge_pos[0]) + abs(nc - env.charge_pos[1])
-            safe_actions.append((a_idx, new_dist))
-            if new_dist < cur_dist:
-                better_actions.append(a_idx)
-        if better_actions:
-            action = random.choice(better_actions)
-        elif safe_actions:
-            best_dist = min(d for _, d in safe_actions)
-            best_actions = [a for a, d in safe_actions if d == best_dist]
-            action = random.choice(best_actions)
+    else:
+        action = int(np.argmax(q_vals))
 
     return action
-
+    
 def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
                  train_mode=True, episode_start=0, max_total_steps=None,
                  success_early_stop=True, success_stop_window=100,
@@ -794,8 +821,7 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
     stop_reason = "completed_all_episodes"
     run_t0 = time.perf_counter()
     chunk_t0 = run_t0
-    
-    # Debug training accumulators
+
     debug_success_count = 0
     debug_battery_dead_count = 0
     debug_blocked_count = 0
@@ -817,7 +843,7 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
         total_reward   = 0.0
         steps          = 0
         local_stop     = False
-        
+
         ep_blocked = 0
         ep_battery_dead = False
 
@@ -834,7 +860,7 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
             action = select_policy_action(agent, env, state, force_greedy=False)
 
             next_state, reward, done, info = env.step(action)
-            
+
             if info.get("blocked"):
                 ep_blocked += 1
             if info.get("battery_dead"):
@@ -860,21 +886,18 @@ def run_episodes(agent, env, n_episodes, hp, callback=None, stop_flag=None,
         if train_mode:
             agent.decay_epsilon()
             if (ep + 1) > 2000:
-                agent.epsilon = 0.1
+                agent.epsilon = max(agent.epsilon, 0.1)
             agent.episode_count += 1
-            # PyTorch uyarısını önlemek için: scheduler sadece optimizer en az bir kez çalıştıysa.
             if hasattr(agent, 'scheduler') and getattr(agent, 'optim_steps', 0) > 0:
                 agent.scheduler.step()
 
-        success = int(env.visited_count == env.cleanable_count)
-        
-        # Update debug aggregations
+        success = int(env.visited_count == env.cleanable_count and env.robot_pos == env.charge_pos)
+
         debug_success_count += success
         if ep_battery_dead:
             debug_battery_dead_count += 1
         debug_blocked_count += ep_blocked
 
-        # Debug print every 100 episodes
         if train_mode and (ep + 1) % 100 == 0:
             now = time.perf_counter()
             chunk_sec = now - chunk_t0
@@ -1135,7 +1158,6 @@ def hp_search(base_hp, env_kwargs, use_ddqn, training_budget_steps=50000,
 
         wd = data[-min(eval_window,len(data)):]
         rewards = [d["reward"] for d in wd]; successes = [d["success"] for d in wd]
-        suc_eps = [d for d in wd if d["success"]==1]
         avg_r   = float(np.mean(rewards)) if rewards else 0.0
         suc_r   = float(np.mean(successes)) if successes else 0.0
         avg_e   = float(np.mean([d["energy"] for d in wd])) if wd else 0.0
@@ -1191,7 +1213,7 @@ class App:
         }
 
         self.hp_vars      = {}
-        self.model_var    = tk.StringVar(value="DDQN")  # varsayılan DDQN
+        self.model_var    = tk.StringVar(value="DDQN")
         self.model_name_var = tk.StringVar(value="")
         self.load_model_name_var = tk.StringVar(value="")
         self.obstacle_var = tk.StringVar(value="Yok")
@@ -1319,36 +1341,21 @@ class App:
                            font=("Consolas",8)).pack(anchor="w", padx=8)
 
         tk.Checkbutton(
-            sec,
-            text="CUDA Kullan (küçük modelde yavaş olabilir)",
-            variable=self.use_cuda_var,
-            bg=THEME["bg_panel"],
-            fg=THEME["text"],
-            selectcolor=THEME["bg_card"],
-            activebackground=THEME["bg_panel"],
-            font=("Consolas",8),
+            sec, text="CUDA Kullan", variable=self.use_cuda_var,
+            bg=THEME["bg_panel"], fg=THEME["text"], selectcolor=THEME["bg_card"],
+            activebackground=THEME["bg_panel"], font=("Consolas",8),
         ).pack(anchor="w", padx=8, pady=(6, 0))
 
         tk.Checkbutton(
-            sec,
-            text="Eğitimde Grid Çiz",
-            variable=self.render_grid_train_var,
-            bg=THEME["bg_panel"],
-            fg=THEME["text"],
-            selectcolor=THEME["bg_card"],
-            activebackground=THEME["bg_panel"],
-            font=("Consolas",8),
+            sec, text="Eğitimde Grid Çiz", variable=self.render_grid_train_var,
+            bg=THEME["bg_panel"], fg=THEME["text"], selectcolor=THEME["bg_card"],
+            activebackground=THEME["bg_panel"], font=("Consolas",8),
         ).pack(anchor="w", padx=8, pady=(6, 0))
 
         tk.Checkbutton(
-            sec,
-            text="Eğitimde GIF Frame Kaydet",
-            variable=self.capture_gif_train_var,
-            bg=THEME["bg_panel"],
-            fg=THEME["text"],
-            selectcolor=THEME["bg_card"],
-            activebackground=THEME["bg_panel"],
-            font=("Consolas",8),
+            sec, text="Eğitimde GIF Frame Kaydet", variable=self.capture_gif_train_var,
+            bg=THEME["bg_panel"], fg=THEME["text"], selectcolor=THEME["bg_card"],
+            activebackground=THEME["bg_panel"], font=("Consolas",8),
         ).pack(anchor="w", padx=8, pady=(4, 0))
 
         nrow = tk.Frame(sec, bg=THEME["bg_panel"])
@@ -1430,6 +1437,12 @@ class App:
         self.step_label_var = tk.StringVar(value="Adım: 0  |  Episode: 0")
         tk.Label(center, textvariable=self.step_label_var, bg=THEME["bg_dark"],
                  fg=THEME["text_dim"], font=("Consolas",8)).pack(pady=(0,4))
+
+        # State dim bilgisi
+        self.state_dim_var = tk.StringVar(value="State Dim: —")
+        tk.Label(center, textvariable=self.state_dim_var, bg=THEME["bg_dark"],
+                 fg=THEME["text_dim"], font=("Consolas",7)).pack(pady=(0,2))
+
         self._draw_grid_init()
 
     def _draw_grid_init(self):
@@ -1591,10 +1604,13 @@ class App:
         self.chart_mgr.reset()
         self.env.reset(); self._draw_grid(self.env.get_grid_info())
         self.step_label_var.set("Adım: 0  |  Episode: 0")
+        if hasattr(self, 'state_dim_var'):
+            self.state_dim_var.set(f"State Dim: {self.env.state_dim} | Actions: {self.env.action_dim}")
         self._clear_info_panel(); self._clear_summary_panel()
         self.chart_mgr.update_all(); self._update_control_states()
         self._set_status(
-            f"✅ Hazır. Algoritma: {self.agent.algorithm_name} | Ad: {self.model_name} | Cihaz: {self.agent.device.type.upper()} | State dim: {self.env.state_dim}"
+            f"✅ Hazır. Algoritma: {self.agent.algorithm_name} | Ad: {self.model_name} | "
+            f"Cihaz: {self.agent.device.type.upper()} | State dim: {self.env.state_dim}"
         )
         if "model_name" in self.info_labels:
             self.info_labels["model_name"].config(text=self.model_name)
@@ -1619,7 +1635,7 @@ class App:
         self.current_train_hp["obstacle_map"] = self.obstacle_var.get()
         self._log_current_run(
             f"train_start model={self.model_var.get()} algorithm={self.agent.algorithm_name} name={self.model_name} episodes={n} "
-            f"obstacle_map={self.obstacle_var.get()}"
+            f"obstacle_map={self.obstacle_var.get()} state_dim={self.env.state_dim}"
         )
 
         def callback(ep_idx, info, grid_info):
@@ -1890,7 +1906,16 @@ class App:
         def test_step(step_n,state):
             if self.stop_flag[0] or self.env.done or self.env.step_count >= self.env.max_steps:
                 self.is_testing=False; self._update_control_states()
-                self._set_status(f"✅ Test bitti. Temizlenen: {self.env.visited_count}/{self.env.cleanable_count}")
+                success_str = (
+                    "✅ BAŞARILI!" if (self.env.visited_count == self.env.cleanable_count
+                                        and self.env.robot_pos == self.env.charge_pos)
+                    else "❌ Tamamlanamadı"
+                )
+                self._set_status(
+                    f"🧪 Test bitti. {success_str} "
+                    f"Temizlenen: {self.env.visited_count}/{self.env.cleanable_count} "
+                    f"Adım: {self.env.step_count}"
+                )
                 return
             action=select_policy_action(self.agent, self.env, state, force_greedy=True)
             next_state,reward,done,info=self.env.step(action)
